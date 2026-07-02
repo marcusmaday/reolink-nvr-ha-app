@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.4.51
+
+- Restore direct mobile app notification services in the blueprint because Home Assistant's generic `notify.send_message` action rejects the companion-app-specific `data` payload used for images, deep links, and notification actions.
+
 ## 0.4.50
 
 - Make the blueprint unlock action truly optional by defaulting it to an empty action list, so non-doorbell cameras no longer need a placeholder unlock step.

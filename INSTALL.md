@@ -83,7 +83,7 @@ Then create an automation from the blueprint and choose:
 4. Optional vehicle sensors
 5. Your snapshot camera
 6. Optional unlock action for the doorbell camera
-7. Your two mobile notification targets
+7. Your two mobile app notify services, such as `notify.mobile_app_pixel_8_pro`
 8. Your app navigation path or URL
 
 Recommended value:
@@ -102,7 +102,7 @@ The blueprint handles:
 - tap-to-open event clips
 - tap-to-open live view
 - optional unlock actions for doorbell notifications
-- notify-target selection from the Home Assistant UI
+- direct mobile app notifications with images, deep links, and notification actions
 
 ## 5. Add The Relay Command To Home Assistant
 

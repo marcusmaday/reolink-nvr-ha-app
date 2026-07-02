@@ -67,7 +67,7 @@ Create the automation from the blueprint and choose:
 - optional vehicle sensors
 - snapshot camera
 - optional unlock action for the doorbell camera
-- two mobile notification targets
+- two mobile app notify services such as `notify.mobile_app_pixel_8_pro`
 - app navigation path or URL
 
 Recommended value:

@@ -80,20 +80,20 @@ blueprint:
       default: "/app/15e0e6e5_watchtower"
       selector:
         text: {}
-    notify_target_primary:
-      name: Primary notification target
-      description: Notify entity for the first phone.
+    notify_service_primary:
+      name: Primary mobile app notify service
+      description: >
+        Mobile app notify service for the first phone, for example
+        `notify.mobile_app_pixel_8_pro`.
       selector:
-        target:
-          entity:
-            domain: notify
-    notify_target_secondary:
-      name: Secondary notification target
-      description: Notify entity for the second phone.
+        text: {}
+    notify_service_secondary:
+      name: Secondary mobile app notify service
+      description: >
+        Mobile app notify service for the second phone, for example
+        `notify.mobile_app_pixel_10_pro`.
       selector:
-        target:
-          entity:
-            domain: notify
+        text: {}
 
 mode: single
 
@@ -178,8 +178,7 @@ actions:
               title: "{{ notif_title }}"
               message: "{{ msg }}"
               source: "home_assistant"
-          - action: notify.send_message
-            target: !input notify_target_primary
+          - action: !input notify_service_primary
             data:
               title: "{{ notif_title }}"
               message: "{{ msg }}"
@@ -193,8 +192,7 @@ actions:
                   ] if unlock_enabled else [
                     {"action": "URI", "title": "View Event Clip", "uri": app_event_url}
                   ] }}
-          - action: notify.send_message
-            target: !input notify_target_secondary
+          - action: !input notify_service_secondary
             data:
               title: "{{ notif_title }}"
               message: "{{ msg }}"
@@ -258,8 +256,7 @@ actions:
               title: "{{ notif_title }}"
               message: "{{ msg }}"
               source: "home_assistant"
-          - action: notify.send_message
-            target: !input notify_target_primary
+          - action: !input notify_service_primary
             data:
               title: "{{ notif_title }}"
               message: "{{ msg }}"
@@ -270,8 +267,7 @@ actions:
                   - action: URI
                     title: View Event Clip
                     uri: "{{ app_event_url }}"
-          - action: notify.send_message
-            target: !input notify_target_secondary
+          - action: !input notify_service_secondary
             data:
               title: "{{ notif_title }}"
               message: "{{ msg }}"
@@ -332,8 +328,7 @@ actions:
               title: "{{ notif_title }}"
               message: "{{ msg }}"
               source: "home_assistant"
-          - action: notify.send_message
-            target: !input notify_target_primary
+          - action: !input notify_service_primary
             data:
               title: "{{ notif_title }}"
               message: "{{ msg }}"
@@ -344,8 +339,7 @@ actions:
                   - action: URI
                     title: View Event Clip
                     uri: "{{ app_event_url }}"
-          - action: notify.send_message
-            target: !input notify_target_secondary
+          - action: !input notify_service_secondary
             data:
               title: "{{ notif_title }}"
               message: "{{ msg }}"
@@ -406,8 +400,7 @@ actions:
               title: "{{ notif_title }}"
               message: "{{ msg }}"
               source: "home_assistant"
-          - action: notify.send_message
-            target: !input notify_target_primary
+          - action: !input notify_service_primary
             data:
               title: "{{ notif_title }}"
               message: "{{ msg }}"
@@ -418,8 +411,7 @@ actions:
                   - action: URI
                     title: View Event Clip
                     uri: "{{ app_event_url }}"
-          - action: notify.send_message
-            target: !input notify_target_secondary
+          - action: !input notify_service_secondary
             data:
               title: "{{ notif_title }}"
               message: "{{ msg }}"
