@@ -1,5 +1,5 @@
 name: "Watchtower"
-version: "0.4.51"
+version: "0.4.53"
 description: "Camera event dashboard, clip playback, and live view for a Reolink NVR"
 slug: "watchtower"
 url: "https://github.com/marcusmaday/reolink-nvr-watchtower"
@@ -13,6 +13,7 @@ host_network: true
 ingress: true
 ingress_port: 5000
 ingress_stream: true
+homeassistant_api: true
 panel_icon: "mdi:camera"
 panel_title: "Watchtower"
 ports:

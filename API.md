@@ -32,6 +32,22 @@ Returns the list of available channels and their names, plus whether each one is
 
 Returns the resolved Watchtower camera selection: available channels, participating channels, buffered channels, each camera's allowed event types, the supported event-type list, and the default live camera.
 
+### `GET /api/home-assistant/status`
+
+Returns whether Watchtower can reach Home Assistant Core through the Supervisor proxy and which `notify.mobile_app_*` services it discovers.
+
+### `GET /api/notifications/config`
+
+Returns the persisted Watchtower-managed notification settings together with the discovered Home Assistant mobile app notify services.
+
+### `PUT /api/notifications/config`
+
+Updates the persisted Watchtower-managed notification settings.
+
+### `POST /api/notifications/test`
+
+Sends a simple test notification through one configured Home Assistant mobile app notify service.
+
 ### `GET /api/debug/info`
 
 Returns runtime configuration and rolling-buffer status. This endpoint is only available when debug mode is enabled.

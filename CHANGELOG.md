@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.4.53
+
+- Add the first in-app managed-notification settings UI so Watchtower can discover Home Assistant mobile app services, enable app-managed notifications, send a test notification, and edit per-camera event rules without leaving the app.
+
+## 0.4.52
+
+- Begin the move to app-managed notifications by adding persisted Watchtower notification settings, Home Assistant mobile app service discovery, and backend endpoints for in-app notification configuration and testing.
+- Add opt-in managed notification delivery from Watchtower for ingested and webhook events using Home Assistant Core service calls through the Supervisor proxy.
+
 ## 0.4.51
 
 - Restore direct mobile app notification services in the blueprint because Home Assistant's generic `notify.send_message` action rejects the companion-app-specific `data` payload used for images, deep links, and notification actions.

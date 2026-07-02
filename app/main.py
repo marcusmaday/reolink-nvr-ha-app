@@ -34,6 +34,15 @@ from timeline_index import TimelineIndex, TimelineEntry
 from storage_manager import StorageManager
 from rolling_buffer import RollingSegmentBuffer
 from reolink_search import search_recordings, get_channels_info, EVENT_TYPE_MAP
+from ha_client import HomeAssistantClient, HomeAssistantClientError
+from settings_store import (
+    SUPPORTED_EVENT_TYPES,
+    CameraNotificationSettings,
+    ManagedNotificationSettings,
+    NotificationRule,
+    SettingsStore,
+    WatchtowerSettings,
+)
 
 logging.basicConfig(
     level=logging.DEBUG if os.getenv("DEBUG", "false").lower() == "true" else logging.INFO,
@@ -85,6 +94,7 @@ ROLLING_BUFFER_MONITOR_INTERVAL_SECONDS = max(
 EVENT_DEDUPE_WINDOW_SECONDS = max(int(os.getenv("EVENT_DEDUPE_WINDOW_SECONDS", "8")), 1)
 CLIPS_DIRECTORY = Path(APP_CONFIG.storage.clips_directory)
 INDEX_FILE = APP_CONFIG.storage.index_file
+SETTINGS_FILE = APP_CONFIG.storage.settings_file
 RETENTION_DAYS = APP_CONFIG.storage.retention_days
 MAX_STORAGE_MB = APP_CONFIG.storage.max_storage_mb
 EXTERNAL_STORAGE_PATH = APP_CONFIG.storage.external_storage_path
@@ -122,6 +132,10 @@ participating_channels: set[int] = set()
 buffered_channels: set[int] = set()
 default_live_channel: Optional[int] = None
 allowed_event_types_by_channel: dict[int, set[str]] = {}
+settings_store: Optional[SettingsStore] = None
+watchtower_settings: WatchtowerSettings = WatchtowerSettings()
+ha_client = HomeAssistantClient(supervisor_token=os.getenv("SUPERVISOR_TOKEN"))
+notification_delivery_history: dict[tuple[int, str], datetime] = {}
 
 
 # ─── Pydantic models ──────────────────────────────────────────────────────────
@@ -172,6 +186,22 @@ class CameraSelectionInfo(BaseModel):
     buffered_channels: list[int]
     default_live_channel: Optional[int] = None
     supported_event_types: list[str] = Field(default_factory=list)
+
+
+class HomeAssistantStatus(BaseModel):
+    enabled: bool
+    discovered_mobile_notify_services: list[str] = Field(default_factory=list)
+
+
+class NotificationTestRequest(BaseModel):
+    service: str
+    title: str = "Watchtower Test"
+    message: str = "Watchtower managed notifications are connected."
+
+
+class NotificationConfigResponse(BaseModel):
+    settings: ManagedNotificationSettings
+    home_assistant: HomeAssistantStatus
 
 
 class HealthCheck(BaseModel):
@@ -257,7 +287,7 @@ def _sorted_channels(channels: set[int]) -> list[int]:
 
 
 def _supported_event_types() -> list[str]:
-    return list(EVENT_TYPE_MAP.keys())
+    return list(SUPPORTED_EVENT_TYPES)
 
 
 def _default_event_type_set() -> set[str]:
@@ -346,6 +376,110 @@ def _channel_allows_event_type(channel: int, event_type: Optional[str]) -> bool:
     if normalized is None:
         return False
     return normalized in _channel_allowed_event_types(channel)
+
+
+def _sync_watchtower_settings() -> None:
+    global watchtower_settings
+    if not settings_store:
+        return
+    watchtower_settings = settings_store.sync_notification_cameras(
+        watchtower_settings,
+        channels=available_channels,
+        participating_channels=participating_channels,
+        allowed_event_types_by_channel=allowed_event_types_by_channel,
+    )
+    settings_store.save(watchtower_settings)
+
+
+def _notification_camera_settings(channel: int) -> Optional[CameraNotificationSettings]:
+    for camera in watchtower_settings.notifications.cameras:
+        if camera.channel == channel:
+            return camera
+    return None
+
+
+def _render_notification_text(template: Optional[str], fallback: str, *, entry: TimelineEntry) -> str:
+    if not template:
+        return fallback
+
+    metadata = entry.metadata or {}
+    try:
+        return template.format(
+            camera_name=metadata.get("camera_name") or _channel_name(entry.channel) or f"Channel {entry.channel}",
+            event_type=entry.event_type,
+            channel=entry.channel,
+            timestamp=entry.timestamp.isoformat(),
+            title=metadata.get("title") or fallback,
+            message=metadata.get("message") or fallback,
+        )
+    except Exception as exc:
+        logger.warning("Failed to render notification template '%s': %s", template, exc)
+        return fallback
+
+
+def _build_managed_app_event_url(entry: TimelineEntry) -> str:
+    base = (watchtower_settings.notifications.app_target or "/app/15e0e6e5_watchtower").strip() or "/app/15e0e6e5_watchtower"
+    separator = "&" if "?" in base else "?"
+    return f"{base}{separator}event_id={entry.entry_id}"
+
+
+async def _send_managed_notifications(entry: TimelineEntry) -> None:
+    if not ha_client.enabled or not watchtower_settings.notifications.enabled:
+        return
+
+    camera_settings = _notification_camera_settings(entry.channel)
+    if not camera_settings or not camera_settings.enabled:
+        return
+
+    rule = camera_settings.rules.get(entry.event_type)
+    if not rule or not rule.enabled:
+        return
+
+    notify_services = camera_settings.notify_services or watchtower_settings.notifications.default_notify_services
+    if not notify_services:
+        logger.info("Managed notifications enabled but no notify services are configured for channel %d", entry.channel)
+        return
+
+    now = datetime.now()
+    history_key = (entry.channel, entry.event_type)
+    last_sent = notification_delivery_history.get(history_key)
+    cooldown_seconds = max(int(rule.cooldown_seconds), 0)
+    if last_sent and (now - last_sent).total_seconds() < cooldown_seconds:
+        logger.info(
+            "Skipping managed notification for %s due to cooldown (%ss)",
+            entry.entry_id,
+            cooldown_seconds,
+        )
+        return
+
+    metadata = entry.metadata or {}
+    title = _render_notification_text(rule.title_template, metadata.get("title") or f"{entry.event_type.title()} detected", entry=entry)
+    message = _render_notification_text(rule.message_template, metadata.get("message") or f"{entry.event_type.title()} detected", entry=entry)
+    snapshot_url = metadata.get("snapshot_url") or entry.thumbnail_path
+    app_event_url = _build_managed_app_event_url(entry)
+    payload = {
+        "title": title,
+        "message": message,
+        "data": {
+            "image": f"{snapshot_url}?v={int(now.timestamp())}" if snapshot_url else None,
+            "clickAction": app_event_url,
+            "actions": [
+                {"action": "URI", "title": "View Event Clip", "uri": app_event_url},
+            ],
+        },
+    }
+    if payload["data"]["image"] is None:
+        payload["data"].pop("image", None)
+
+    for service in notify_services:
+        try:
+            await ha_client.call_service(service, payload)
+        except HomeAssistantClientError as exc:
+            logger.error("Managed notification via %s failed for %s: %s", service, entry.entry_id, exc)
+            return
+
+    notification_delivery_history[history_key] = now
+    logger.info("Managed notifications sent for %s via %s", entry.entry_id, notify_services)
 
 
 def _resolve_ingest_channel(payload_channel: int, camera_name: Optional[str]) -> int:
@@ -444,9 +578,13 @@ async def _rolling_buffer_monitor_loop() -> None:
 async def lifespan(app: FastAPI):
     global nvr_host, timeline_index, rolling_buffers, rolling_buffer_monitor_task, storage_manager
     global available_channels, participating_channels, buffered_channels, default_live_channel, allowed_event_types_by_channel
+    global settings_store, watchtower_settings
 
     logger.info("Starting Watchtower...")
     logger.info("Connecting to NVR at %s:%s", NVR_HOST, NVR_PORT)
+    settings_store = SettingsStore(SETTINGS_FILE)
+    watchtower_settings = settings_store.load()
+    logger.info("Home Assistant API access: %s", "enabled" if ha_client.enabled else "disabled")
 
     try:
         nvr_host = Host(
@@ -493,6 +631,7 @@ async def lifespan(app: FastAPI):
                 for channel in _sorted_channels(participating_channels)
             },
         )
+        _sync_watchtower_settings()
     except ReolinkError as e:
         logger.error("Failed to connect to NVR: %s", e)
         nvr_host = None
@@ -582,7 +721,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title=APP_NAME,
     description="Camera event dashboard, clip playback, and live view for a Reolink NVR",
-    version="0.4.51",
+    version="0.4.53",
     lifespan=lifespan,
 )
 
@@ -1214,10 +1353,10 @@ async def _proxy_http_media(url: str):
 async def root(request: Request):
     accept = request.headers.get("accept", "")
     if "text/html" in accept or "application/xhtml+xml" in accept:
-        return HTMLResponse(_dashboard_html())
+        return HTMLResponse(_dashboard_html_v2())
     return {
         "name": APP_NAME,
-        "version": "0.4.51",
+        "version": "0.4.53",
         "status": "running",
         "docs": "/docs",
         "health": "/api/health",
@@ -1261,6 +1400,61 @@ async def get_camera_config():
         default_live_channel=default_live_channel,
         supported_event_types=_supported_event_types(),
     )
+
+
+@app.get("/api/home-assistant/status", response_model=HomeAssistantStatus, summary="Home Assistant API status for Watchtower")
+async def get_home_assistant_status():
+    services = await ha_client.list_mobile_app_notify_services() if ha_client.enabled else []
+    return HomeAssistantStatus(
+        enabled=ha_client.enabled,
+        discovered_mobile_notify_services=services,
+    )
+
+
+@app.get("/api/notifications/config", response_model=NotificationConfigResponse, summary="Managed notification settings")
+async def get_notification_config():
+    services = await ha_client.list_mobile_app_notify_services() if ha_client.enabled else []
+    return NotificationConfigResponse(
+        settings=watchtower_settings.notifications,
+        home_assistant=HomeAssistantStatus(
+            enabled=ha_client.enabled,
+            discovered_mobile_notify_services=services,
+        ),
+    )
+
+
+@app.put("/api/notifications/config", response_model=NotificationConfigResponse, summary="Update managed notification settings")
+async def update_notification_config(settings: ManagedNotificationSettings):
+    global watchtower_settings
+    watchtower_settings.notifications = settings
+    _sync_watchtower_settings()
+    services = await ha_client.list_mobile_app_notify_services() if ha_client.enabled else []
+    return NotificationConfigResponse(
+        settings=watchtower_settings.notifications,
+        home_assistant=HomeAssistantStatus(
+            enabled=ha_client.enabled,
+            discovered_mobile_notify_services=services,
+        ),
+    )
+
+
+@app.post("/api/notifications/test", summary="Send a managed notification test")
+async def send_notification_test(payload: NotificationTestRequest):
+    if not ha_client.enabled:
+        raise HTTPException(status_code=503, detail="Home Assistant API access is not enabled for Watchtower.")
+
+    try:
+        await ha_client.call_service(
+            payload.service,
+            {
+                "title": payload.title,
+                "message": payload.message,
+            },
+        )
+    except HomeAssistantClientError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+    return {"status": "sent", "service": payload.service}
 
 
 @app.get("/api/channels", response_model=List[ChannelInfo], summary="List all camera channels")
@@ -1553,6 +1747,8 @@ async def ingest_event(payload: EventIngestRequest):
 
     if created and not clip_url:
         _schedule_clip_generation(entry)
+    if created:
+        asyncio.create_task(_send_managed_notifications(entry))
 
     return {
         "status": "accepted",
@@ -1602,6 +1798,7 @@ async def receive_reolink_webhook(request: Request):
         await _broadcast_recent_event(entry)
         if is_new:
             _schedule_clip_generation(entry)
+            asyncio.create_task(_send_managed_notifications(entry))
         created_events.append(_timeline_entry_to_recent(entry))
 
     if not created_events:
@@ -2389,6 +2586,1133 @@ def _dashboard_html() -> str:
 </html>"""
 
 
+def _dashboard_html_v2() -> str:
+    return """<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Watchtower</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #0f1115;
+      --panel: #171b22;
+      --panel-2: #12161d;
+      --line: #263041;
+      --text: #e6edf3;
+      --muted: #9aa7b7;
+      --accent: #5aa9ff;
+      --warn: #ffcb6b;
+      --success: #7ed6a5;
+      --danger: #ff8a80;
+      --shadow: rgba(0, 0, 0, 0.45);
+    }
+    * { box-sizing: border-box; }
+    html, body { height: 100%; }
+    body {
+      margin: 0;
+      font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      background: var(--bg);
+      color: var(--text);
+    }
+    [hidden] { display: none !important; }
+    header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      padding: 14px 16px;
+      border-bottom: 1px solid var(--line);
+      background: rgba(15, 17, 21, 0.96);
+      position: sticky;
+      top: 0;
+      z-index: 5;
+    }
+    header h1 { margin: 0; font-size: 18px; line-height: 1.2; }
+    header .meta { color: var(--muted); font-size: 13px; line-height: 1.3; }
+    main {
+      display: grid;
+      grid-template-columns: minmax(320px, 360px) minmax(0, 1fr);
+      height: calc(100vh - 65px);
+      overflow: hidden;
+    }
+    aside {
+      border-right: 1px solid var(--line);
+      background: var(--panel);
+      overflow: auto;
+      -webkit-overflow-scrolling: touch;
+      min-height: 0;
+    }
+    section.player {
+      display: grid;
+      grid-template-rows: auto minmax(0, 1fr) auto;
+      min-height: 0;
+      overflow: hidden;
+    }
+    .toolbar {
+      display: flex;
+      gap: 8px;
+      padding: 12px 14px;
+      border-bottom: 1px solid var(--line);
+      align-items: center;
+      flex-wrap: wrap;
+    }
+    .toolbar.space-between { justify-content: space-between; }
+    .chip,
+    button,
+    input,
+    select,
+    textarea {
+      border: 1px solid var(--line);
+      background: var(--panel-2);
+      color: var(--text);
+      border-radius: 10px;
+      font: inherit;
+    }
+    .chip,
+    button {
+      min-height: 42px;
+      padding: 10px 12px;
+      cursor: pointer;
+      touch-action: manipulation;
+    }
+    button.primary {
+      background: rgba(90, 169, 255, 0.16);
+      border-color: rgba(90, 169, 255, 0.6);
+      color: #d5ebff;
+    }
+    button.ghost {
+      background: transparent;
+    }
+    button:disabled {
+      opacity: 0.55;
+      cursor: not-allowed;
+    }
+    .chip.active { border-color: var(--accent); color: var(--accent); }
+    .events { list-style: none; margin: 0; padding: 0; }
+    .event {
+      padding: 14px 16px;
+      border-bottom: 1px solid var(--line);
+      cursor: pointer;
+      min-height: 64px;
+    }
+    .event:hover { background: rgba(90, 169, 255, 0.08); }
+    .event.active { background: rgba(90, 169, 255, 0.15); }
+    .event .top {
+      display: flex;
+      justify-content: space-between;
+      gap: 12px;
+      font-size: 14px;
+      align-items: flex-start;
+    }
+    .event .time {
+      color: var(--muted);
+      font-size: 12px;
+      margin-top: 4px;
+      line-height: 1.3;
+    }
+    .badge {
+      font-size: 11px;
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+      padding: 3px 7px;
+      border-radius: 999px;
+      background: rgba(90, 169, 255, 0.16);
+      color: #d5ebff;
+      white-space: nowrap;
+    }
+    .badge.doorbell { background: rgba(255, 203, 107, 0.18); color: #ffe4a0; }
+    .badge.ok { background: rgba(126, 214, 165, 0.16); color: #baf2d0; }
+    .badge.warn { background: rgba(255, 203, 107, 0.18); color: #ffe4a0; }
+    .badge.error { background: rgba(255, 138, 128, 0.18); color: #ffc7c2; }
+    .player-wrap {
+      padding: 16px;
+      display: grid;
+      gap: 14px;
+      min-height: 0;
+      overflow: hidden;
+    }
+    video,
+    img.preview {
+      width: 100%;
+      max-height: 64vh;
+      background: #000;
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      object-fit: contain;
+    }
+    .details {
+      display: grid;
+      gap: 8px;
+      padding: 0 16px 16px;
+      color: var(--muted);
+      font-size: 13px;
+      line-height: 1.35;
+      overflow: hidden;
+    }
+    .detail-meta {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px 10px;
+      align-items: center;
+    }
+    .detail-pill {
+      display: inline-flex;
+      align-items: center;
+      gap: 0.35rem;
+      padding: 0.3rem 0.55rem;
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      background: rgba(255, 255, 255, 0.03);
+      color: var(--text);
+      font-size: 12px;
+    }
+    .detail-pill.doorbell {
+      background: rgba(255, 203, 107, 0.18);
+      color: #ffe4a0;
+    }
+    .detail-note { color: var(--muted); font-size: 13px; }
+    .empty { padding: 20px; color: var(--muted); }
+    .row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+    .muted { color: var(--muted); }
+    a.chip {
+      display: inline-flex;
+      align-items: center;
+      text-decoration: none;
+    }
+    .settings-shell {
+      position: fixed;
+      inset: 0;
+      display: flex;
+      justify-content: flex-end;
+      background: rgba(3, 6, 10, 0.6);
+      backdrop-filter: blur(4px);
+      z-index: 20;
+    }
+    .settings-panel {
+      width: min(680px, 100vw);
+      height: 100vh;
+      background: #10151c;
+      border-left: 1px solid var(--line);
+      box-shadow: -20px 0 60px var(--shadow);
+      display: grid;
+      grid-template-rows: auto minmax(0, 1fr) auto;
+      overflow: hidden;
+    }
+    .settings-header,
+    .settings-footer {
+      padding: 14px 16px;
+      border-bottom: 1px solid var(--line);
+      background: rgba(16, 21, 28, 0.98);
+    }
+    .settings-footer {
+      border-bottom: 0;
+      border-top: 1px solid var(--line);
+    }
+    .settings-body {
+      overflow: auto;
+      padding: 16px;
+      display: grid;
+      gap: 16px;
+      align-content: start;
+    }
+    .settings-card {
+      border: 1px solid var(--line);
+      border-radius: 14px;
+      background: var(--panel);
+      padding: 14px;
+      display: grid;
+      gap: 12px;
+    }
+    .settings-card h3,
+    .settings-card h4 {
+      margin: 0;
+      font-size: 15px;
+    }
+    .settings-card p {
+      margin: 0;
+      color: var(--muted);
+      font-size: 13px;
+      line-height: 1.45;
+    }
+    .field {
+      display: grid;
+      gap: 6px;
+    }
+    .field label {
+      color: var(--muted);
+      font-size: 12px;
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+    }
+    input[type="text"],
+    input[type="number"],
+    textarea,
+    select {
+      width: 100%;
+      min-height: 42px;
+      padding: 10px 12px;
+    }
+    textarea {
+      min-height: 80px;
+      resize: vertical;
+    }
+    .toggle {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      padding: 10px 12px;
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      background: rgba(255, 255, 255, 0.03);
+    }
+    .toggle input {
+      width: 20px;
+      height: 20px;
+      accent-color: var(--accent);
+    }
+    .service-grid,
+    .event-rule-grid {
+      display: grid;
+      gap: 10px;
+    }
+    .service-option,
+    .event-rule {
+      display: grid;
+      gap: 8px;
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      padding: 10px 12px;
+      background: rgba(255, 255, 255, 0.03);
+    }
+    .inline-check {
+      display: flex;
+      gap: 10px;
+      align-items: center;
+    }
+    .inline-check input {
+      width: 18px;
+      height: 18px;
+      accent-color: var(--accent);
+      flex: 0 0 auto;
+    }
+    .rule-row {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) 110px;
+      gap: 10px;
+      align-items: center;
+    }
+    .camera-card {
+      display: grid;
+      gap: 12px;
+      border: 1px solid var(--line);
+      border-radius: 14px;
+      padding: 14px;
+      background: rgba(255, 255, 255, 0.02);
+    }
+    .camera-card.disabled {
+      opacity: 0.68;
+    }
+    .camera-header {
+      display: flex;
+      justify-content: space-between;
+      gap: 12px;
+      align-items: flex-start;
+    }
+    .camera-title {
+      display: grid;
+      gap: 4px;
+    }
+    .camera-title small {
+      color: var(--muted);
+      font-size: 12px;
+    }
+    .service-note,
+    .settings-note {
+      color: var(--muted);
+      font-size: 12px;
+      line-height: 1.45;
+    }
+    .header-actions {
+      display: flex;
+      gap: 8px;
+      align-items: center;
+      flex-wrap: wrap;
+    }
+    .spacer { flex: 1 1 auto; }
+    @media (max-width: 900px) {
+      main {
+        grid-template-columns: 1fr;
+        grid-template-rows: minmax(340px, 58vh) minmax(0, 1fr);
+      }
+      aside {
+        border-right: 0;
+        border-bottom: 1px solid var(--line);
+        order: 2;
+      }
+      section.player { order: 1; }
+      header {
+        align-items: flex-start;
+        flex-direction: column;
+      }
+      .toolbar { overflow-x: auto; flex-wrap: nowrap; }
+      video,
+      img.preview {
+        max-height: none;
+        height: min(100%, 58vh);
+      }
+      .player-wrap { padding: 12px; }
+      .details { padding: 0 12px 12px; font-size: 13px; }
+      .event { padding: 16px; }
+      .settings-panel { width: 100vw; }
+      .rule-row { grid-template-columns: 1fr; }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <div>
+      <h1>Watchtower</h1>
+      <div class="meta">Recent camera events with player-first playback</div>
+    </div>
+    <div class="header-actions">
+      <button id="openSettings" class="chip">Notification Settings</button>
+      <div class="meta" id="status">Connecting...</div>
+    </div>
+  </header>
+  <main>
+    <aside>
+      <div class="toolbar" id="eventFilters"></div>
+      <div class="toolbar" id="cameraFilters">
+        <button class="chip active" data-channel-filter="ALL">All Cameras</button>
+      </div>
+      <ul id="events" class="events"></ul>
+    </aside>
+    <section class="player">
+      <div class="toolbar space-between">
+        <div class="row">
+          <button id="refresh">Refresh</button>
+          <span class="muted" id="count">0 events</span>
+        </div>
+        <div class="row">
+          <a id="openLive" class="chip" href="/app/live">Open Live</a>
+        </div>
+      </div>
+      <div class="player-wrap">
+        <video id="player" controls playsinline preload="metadata"></video>
+        <img id="snapshot" class="preview" alt="Event snapshot" hidden>
+      </div>
+      <div class="details" id="details">
+        <div class="empty">No events loaded.</div>
+      </div>
+    </section>
+  </main>
+
+  <div id="settingsShell" class="settings-shell" hidden>
+    <div class="settings-panel">
+      <div class="settings-header">
+        <div class="row">
+          <div>
+            <strong>Managed Notifications</strong>
+            <div class="meta">Configure mobile notifications directly in Watchtower.</div>
+          </div>
+          <div class="spacer"></div>
+          <button id="closeSettings" class="ghost">Close</button>
+        </div>
+      </div>
+      <div class="settings-body" id="settingsBody"></div>
+      <div class="settings-footer">
+        <div class="row">
+          <span class="muted" id="settingsStatus">Loading settings...</span>
+          <div class="spacer"></div>
+          <button id="sendTestNotification" class="ghost">Send Test</button>
+          <button id="saveSettings" class="primary">Save Settings</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    const knownEventTypes = ['PERSON', 'DOORBELL', 'MOTION', 'ANIMAL', 'VEHICLE'];
+    const eventTypeLabels = {
+      PERSON: 'Person',
+      DOORBELL: 'Doorbell',
+      MOTION: 'Motion',
+      ANIMAL: 'Animal',
+      VEHICLE: 'Vehicle',
+    };
+    const defaultNotificationPath = '/app/15e0e6e5_watchtower';
+    const state = {
+      events: [],
+      channels: [],
+      supportedEventTypes: knownEventTypes,
+      filter: 'ALL',
+      channel: 'ALL',
+      selected: null,
+      socket: null,
+      defaultLiveChannel: null,
+      notifications: null,
+      haStatus: null,
+      settingsLoaded: false,
+      settingsSaving: false,
+    };
+
+    const deepLink = new URLSearchParams(window.location.search);
+    const requestedEventType = (() => {
+      const raw = (deepLink.get('event_type') || '').trim().toUpperCase();
+      return knownEventTypes.includes(raw) ? raw : null;
+    })();
+    const requestedChannel = (() => {
+      const raw = (deepLink.get('channel') || '').trim();
+      if (!raw) return 'ALL';
+      const parsed = Number.parseInt(raw, 10);
+      return Number.isFinite(parsed) ? parsed : 'ALL';
+    })();
+    const requestedEventId = (deepLink.get('event_id') || '').trim() || null;
+    if (requestedEventType) state.filter = requestedEventType;
+    state.channel = requestedChannel;
+
+    const elEvents = document.getElementById('events');
+    const elCount = document.getElementById('count');
+    const elStatus = document.getElementById('status');
+    const elEventFilters = document.getElementById('eventFilters');
+    const elCameraFilters = document.getElementById('cameraFilters');
+    const elOpenLive = document.getElementById('openLive');
+    const player = document.getElementById('player');
+    const snapshot = document.getElementById('snapshot');
+    const details = document.getElementById('details');
+    const settingsShell = document.getElementById('settingsShell');
+    const settingsBody = document.getElementById('settingsBody');
+    const settingsStatus = document.getElementById('settingsStatus');
+    const saveSettingsButton = document.getElementById('saveSettings');
+    const sendTestButton = document.getElementById('sendTestNotification');
+
+    function apiUrl(path) {
+      return new URL(path, window.location.href).toString();
+    }
+
+    function wsUrl(path) {
+      const url = new URL(path, window.location.href);
+      url.protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
+      return url.toString();
+    }
+
+    function badgeClass(eventType) {
+      return eventType === 'DOORBELL' ? 'badge doorbell' : 'badge';
+    }
+
+    function formatTime(ts) {
+      try { return new Date(ts).toLocaleString(); } catch (e) { return ts; }
+    }
+
+    function sortNewestFirst(events) {
+      return [...events].sort((a, b) => {
+        const aTime = Date.parse(a.timestamp || '') || 0;
+        const bTime = Date.parse(b.timestamp || '') || 0;
+        if (bTime !== aTime) return bTime - aTime;
+        return String(b.entry_id || '').localeCompare(String(a.entry_id || ''));
+      });
+    }
+
+    function escapeHtml(value) {
+      return String(value ?? '')
+        .replaceAll('&', '&amp;')
+        .replaceAll('<', '&lt;')
+        .replaceAll('>', '&gt;')
+        .replaceAll('"', '&quot;')
+        .replaceAll("'", '&#39;');
+    }
+
+    function cacheBust(url, token) {
+      if (!url) return '';
+      const separator = url.includes('?') ? '&' : '?';
+      return `${url}${separator}v=${encodeURIComponent(token)}`;
+    }
+
+    function activeChannelName(channel) {
+      const info = state.channels.find(item => item.channel === channel);
+      return info?.name || `Channel ${channel}`;
+    }
+
+    function updateLiveLink(entry = null) {
+      const channel = entry?.channel ?? (state.channel !== 'ALL' ? state.channel : state.defaultLiveChannel);
+      elOpenLive.href = channel === null || channel === undefined ? '/app/live' : `/app/live?channel=${channel}`;
+    }
+
+    function normalizeRule(eventType, rule = {}) {
+      return {
+        enabled: !!rule.enabled,
+        cooldown_seconds: Number.isFinite(Number(rule.cooldown_seconds)) ? Math.max(Number(rule.cooldown_seconds), 0) : (eventType === 'DOORBELL' ? 0 : 45),
+        title_template: typeof rule.title_template === 'string' ? rule.title_template : '',
+        message_template: typeof rule.message_template === 'string' ? rule.message_template : '',
+      };
+    }
+
+    function emptyNotificationSettings() {
+      return {
+        enabled: false,
+        app_target: defaultNotificationPath,
+        default_notify_services: [],
+        cameras: [],
+      };
+    }
+
+    function channelAllowedEventTypes(channel) {
+      const info = state.channels.find(item => item.channel === channel);
+      return (info?.allowed_event_types || state.supportedEventTypes).filter(eventType => state.supportedEventTypes.includes(eventType));
+    }
+
+    function syncNotificationSettings() {
+      const base = state.notifications || emptyNotificationSettings();
+      const byChannel = new Map((base.cameras || []).map(camera => [camera.channel, camera]));
+      const syncedCameras = state.channels.map((channelInfo) => {
+        const existing = byChannel.get(channelInfo.channel) || {};
+        const allowedEventTypes = channelAllowedEventTypes(channelInfo.channel);
+        const rules = {};
+        for (const eventType of allowedEventTypes) {
+          rules[eventType] = normalizeRule(eventType, existing.rules?.[eventType]);
+          if (existing.rules?.[eventType] === undefined) {
+            rules[eventType].enabled = true;
+          }
+        }
+        return {
+          channel: channelInfo.channel,
+          camera_name: existing.camera_name || channelInfo.name || `Channel ${channelInfo.channel}`,
+          enabled: existing.enabled !== undefined ? !!existing.enabled : true,
+          notify_services: Array.isArray(existing.notify_services) ? [...existing.notify_services] : [],
+          rules,
+        };
+      });
+      state.notifications = {
+        enabled: !!base.enabled,
+        app_target: typeof base.app_target === 'string' && base.app_target.trim() ? base.app_target.trim() : defaultNotificationPath,
+        default_notify_services: Array.isArray(base.default_notify_services) ? [...base.default_notify_services] : [],
+        cameras: syncedCameras,
+      };
+    }
+
+    function notificationCamera(channel) {
+      return state.notifications?.cameras?.find(camera => camera.channel === channel) || null;
+    }
+
+    function availableNotifyServices() {
+      return state.haStatus?.discovered_mobile_notify_services || [];
+    }
+
+    function serviceCheckboxList(selectedServices, attrs) {
+      const services = availableNotifyServices();
+      if (!services.length) {
+        return '<div class="settings-note">No mobile app notify services were discovered yet. Open the Home Assistant companion app on your phone first, then reload Watchtower.</div>';
+      }
+      return `<div class="service-grid">${services.map(service => `
+        <label class="service-option">
+          <span class="inline-check">
+            <input type="checkbox" ${attrs} value="${escapeHtml(service)}" ${selectedServices.includes(service) ? 'checked' : ''}>
+            <span>${escapeHtml(service)}</span>
+          </span>
+        </label>
+      `).join('')}</div>`;
+    }
+
+    function renderEventFilters() {
+      const enabledEventTypes = state.supportedEventTypes.filter(eventType =>
+        state.channels.some(info => (info.allowed_event_types || []).includes(eventType))
+      );
+      if (state.filter !== 'ALL' && !enabledEventTypes.includes(state.filter)) {
+        state.filter = 'ALL';
+      }
+      const buttons = [
+        `<button class="chip ${state.filter === 'ALL' ? 'active' : ''}" data-filter="ALL">All</button>`,
+        ...enabledEventTypes.map(eventType => `
+          <button class="chip ${state.filter === eventType ? 'active' : ''}" data-filter="${eventType}">
+            ${escapeHtml(eventTypeLabels[eventType] || eventType)}
+          </button>
+        `),
+      ];
+      elEventFilters.innerHTML = buttons.join('');
+    }
+
+    function renderChannelFilters() {
+      const buttons = [
+        `<button class="chip ${state.channel === 'ALL' ? 'active' : ''}" data-channel-filter="ALL">All Cameras</button>`,
+        ...state.channels.map(info => `
+          <button class="chip ${state.channel === info.channel ? 'active' : ''}" data-channel-filter="${info.channel}">
+            ${escapeHtml(info.name || `Channel ${info.channel}`)}
+          </button>
+        `),
+      ];
+      elCameraFilters.innerHTML = buttons.join('');
+    }
+
+    function visibleEvents() {
+      let events = state.filter === 'ALL' ? state.events : state.events.filter(e => e.event_type === state.filter);
+      if (state.channel !== 'ALL') {
+        events = events.filter(e => e.channel === state.channel);
+      }
+      return sortNewestFirst(events);
+    }
+
+    function haStatusBadge() {
+      if (!state.haStatus) {
+        return '<span class="badge warn">Checking...</span>';
+      }
+      if (state.haStatus.enabled) {
+        return '<span class="badge ok">Connected</span>';
+      }
+      return '<span class="badge error">Unavailable</span>';
+    }
+
+    function renderNotificationSettings() {
+      if (!settingsShell || !settingsBody) return;
+      if (!state.settingsLoaded || !state.notifications) {
+        settingsBody.innerHTML = '<div class="settings-card"><p>Loading notification settings...</p></div>';
+        return;
+      }
+
+      const settings = state.notifications;
+      const discoveredServices = availableNotifyServices();
+      const testServiceOptions = discoveredServices.map(service => `<option value="${escapeHtml(service)}">${escapeHtml(service)}</option>`).join('');
+
+      settingsBody.innerHTML = `
+        <div class="settings-card">
+          <div class="row">
+            <h3>Home Assistant Connection</h3>
+            ${haStatusBadge()}
+          </div>
+          <p>Watchtower can send mobile notifications through the Home Assistant Supervisor proxy. This only works for mobile app notify services.</p>
+          <div class="field">
+            <label>Discovered Mobile App Services</label>
+            <div class="settings-note">${discoveredServices.length ? escapeHtml(discoveredServices.join(', ')) : 'None discovered yet.'}</div>
+          </div>
+        </div>
+
+        <div class="settings-card">
+          <div class="toggle">
+            <div>
+              <strong>Enable Watchtower-managed notifications</strong>
+              <div class="settings-note">When enabled, Watchtower sends notifications itself after event ingest and clip generation starts.</div>
+            </div>
+            <input type="checkbox" id="notificationsEnabled" ${settings.enabled ? 'checked' : ''}>
+          </div>
+
+          <div class="field">
+            <label for="appTarget">App target</label>
+            <input id="appTarget" type="text" value="${escapeHtml(settings.app_target || defaultNotificationPath)}" placeholder="${escapeHtml(defaultNotificationPath)}">
+            <div class="settings-note">Default is the Home Assistant ingress path for this add-on. Watchtower appends the event id automatically.</div>
+          </div>
+
+          <div class="field">
+            <label>Default notify services</label>
+            ${serviceCheckboxList(settings.default_notify_services || [], 'data-default-service')}
+            <div class="settings-note">These services are used by any camera still set to inherit the default service list.</div>
+          </div>
+
+          <div class="field">
+            <label for="testService">Test notification service</label>
+            <select id="testService" ${!discoveredServices.length ? 'disabled' : ''}>
+              ${testServiceOptions || '<option value="">No services available</option>'}
+            </select>
+          </div>
+        </div>
+
+        <div class="settings-card">
+          <h3>Per-camera rules</h3>
+          <p>Each camera can be enabled or muted independently. Event types shown here already respect Watchtower's participating-camera and allowed-event-type configuration.</p>
+          ${settings.cameras.map(camera => {
+            const usesDefaultServices = !camera.notify_services || camera.notify_services.length === 0;
+            const cameraRules = Object.entries(camera.rules || {}).map(([eventType, rule]) => `
+              <div class="event-rule">
+                <div class="rule-row">
+                  <label class="inline-check">
+                    <input type="checkbox" data-rule-enabled="${camera.channel}:${eventType}" ${rule.enabled ? 'checked' : ''}>
+                    <span><strong>${escapeHtml(eventTypeLabels[eventType] || eventType)}</strong></span>
+                  </label>
+                  <div class="field">
+                    <label>Cooldown (s)</label>
+                    <input type="number" min="0" step="1" data-rule-cooldown="${camera.channel}:${eventType}" value="${escapeHtml(rule.cooldown_seconds)}">
+                  </div>
+                </div>
+                <div class="field">
+                  <label>Title template</label>
+                  <input type="text" data-rule-title="${camera.channel}:${eventType}" value="${escapeHtml(rule.title_template || '')}" placeholder="Leave blank to use the event title">
+                </div>
+                <div class="field">
+                  <label>Message template</label>
+                  <textarea data-rule-message="${camera.channel}:${eventType}" placeholder="Leave blank to use the event message">${escapeHtml(rule.message_template || '')}</textarea>
+                </div>
+              </div>
+            `).join('');
+            return `
+              <div class="camera-card ${camera.enabled ? '' : 'disabled'}">
+                <div class="camera-header">
+                  <div class="camera-title">
+                    <h4>${escapeHtml(camera.camera_name || activeChannelName(camera.channel))}</h4>
+                    <small>Watchtower channel ${camera.channel}</small>
+                  </div>
+                  <label class="inline-check">
+                    <input type="checkbox" data-camera-enabled="${camera.channel}" ${camera.enabled ? 'checked' : ''}>
+                    <span>Enabled</span>
+                  </label>
+                </div>
+
+                <label class="inline-check">
+                  <input type="checkbox" data-camera-inherit="${camera.channel}" ${usesDefaultServices ? 'checked' : ''}>
+                  <span>Use default notify services</span>
+                </label>
+
+                <div class="field" ${usesDefaultServices ? 'hidden' : ''} data-camera-services-wrap="${camera.channel}">
+                  <label>Camera-specific notify services</label>
+                  ${serviceCheckboxList(camera.notify_services || [], `data-camera-service="${camera.channel}"`)}
+                  <div class="service-note">Leave all camera-specific services unchecked if you want to switch this camera back to the default list.</div>
+                </div>
+
+                <div class="event-rule-grid">${cameraRules || '<div class="settings-note">No event types are enabled for this camera.</div>'}</div>
+              </div>
+            `;
+          }).join('')}
+        </div>
+      `;
+
+      const firstService = settings.default_notify_services?.[0] || discoveredServices[0] || '';
+      const testServiceSelect = document.getElementById('testService');
+      if (testServiceSelect && firstService) {
+        testServiceSelect.value = firstService;
+      }
+
+      saveSettingsButton.disabled = state.settingsSaving;
+      sendTestButton.disabled = !state.haStatus?.enabled || !discoveredServices.length;
+    }
+
+    function render() {
+      renderEventFilters();
+      renderChannelFilters();
+      const events = visibleEvents();
+      elCount.textContent = `${events.length} event${events.length === 1 ? '' : 's'}`;
+      elEvents.innerHTML = events.map(e => `
+        <li class="event ${state.selected === e.entry_id ? 'active' : ''}" data-id="${escapeHtml(e.entry_id)}">
+          <div class="top">
+            <strong>${escapeHtml(e.title || e.event_type)}</strong>
+            <span class="${badgeClass(e.event_type)}">${escapeHtml(e.event_type)}</span>
+          </div>
+          <div class="time">${escapeHtml(formatTime(e.timestamp))}${e.camera_name ? ` - ${escapeHtml(e.camera_name)}` : ''}</div>
+        </li>`).join('') || '<li class="empty">No recent events.</li>';
+
+      if ((!state.selected || !events.find(e => e.entry_id === state.selected)) && events.length) {
+        selectEvent(events[0].entry_id, false);
+        return;
+      }
+      updateLiveLink(state.events.find(e => e.entry_id === state.selected) || null);
+    }
+
+    function setStatus(text) {
+      elStatus.textContent = text;
+    }
+
+    function setSettingsStatus(text) {
+      settingsStatus.textContent = text;
+    }
+
+    async function loadChannels() {
+      const resp = await fetch(apiUrl('api/camera-config'), { cache: 'no-store' });
+      const data = await resp.json();
+      state.channels = (data.available_channels || []).filter(info => info.participating);
+      state.supportedEventTypes = data.supported_event_types || knownEventTypes;
+      state.defaultLiveChannel = data.default_live_channel;
+      if (state.channel !== 'ALL' && !state.channels.find(info => info.channel === state.channel)) {
+        state.channel = 'ALL';
+      }
+      syncNotificationSettings();
+      renderEventFilters();
+      renderChannelFilters();
+      updateLiveLink();
+      if (!settingsShell.hidden && state.settingsLoaded) {
+        renderNotificationSettings();
+      }
+    }
+
+    async function loadRecent() {
+      const resp = await fetch(apiUrl('api/events/recent?limit=50'), { cache: 'no-store' });
+      const data = await resp.json();
+      state.events = sortNewestFirst(data.events || []);
+      if (requestedEventId) {
+        const requestedEvent = await loadRequestedEvent();
+        if (requestedEvent) {
+          state.events = sortNewestFirst([requestedEvent, ...state.events.filter(e => e.entry_id !== requestedEvent.entry_id)]);
+        }
+      }
+      state.selected = requestedEventId && state.events.find(e => e.entry_id === requestedEventId)
+        ? requestedEventId
+        : (state.events.length ? state.events[0].entry_id : null);
+      render();
+      if (state.selected) selectEvent(state.selected, false);
+    }
+
+    async function loadNotificationConfig() {
+      const resp = await fetch(apiUrl('api/notifications/config'), { cache: 'no-store' });
+      if (!resp.ok) {
+        throw new Error(`Failed to load notification config (${resp.status})`);
+      }
+      const data = await resp.json();
+      state.notifications = data.settings || emptyNotificationSettings();
+      state.haStatus = data.home_assistant || { enabled: false, discovered_mobile_notify_services: [] };
+      state.settingsLoaded = true;
+      syncNotificationSettings();
+      renderNotificationSettings();
+      setSettingsStatus(state.haStatus.enabled ? 'Ready to configure managed notifications.' : 'Home Assistant API access is unavailable. Settings can still be saved.');
+    }
+
+    async function loadRequestedEvent() {
+      if (!requestedEventId) return null;
+      const existing = state.events.find(e => e.entry_id === requestedEventId);
+      if (existing) return existing;
+      try {
+        const resp = await fetch(apiUrl(`api/timeline/${encodeURIComponent(requestedEventId)}`), { cache: 'no-store' });
+        if (!resp.ok) return null;
+        return await resp.json();
+      } catch (err) {
+        return null;
+      }
+    }
+
+    function selectEvent(id, userInitiated = true) {
+      const entry = state.events.find(e => e.entry_id === id);
+      if (!entry) return;
+      state.selected = id;
+      render();
+      updateLiveLink(entry);
+      const clipUrl = entry.clip_url;
+      const snapshotUrl = cacheBust(entry.thumbnail_url || entry.metadata?.snapshot_url, entry.entry_id);
+      if (clipUrl) {
+        snapshot.hidden = true;
+        player.hidden = false;
+        player.pause();
+        player.removeAttribute('src');
+        player.load();
+        player.poster = snapshotUrl || '';
+        player.src = clipUrl;
+        player.load();
+        if (userInitiated) player.play().catch(() => {});
+      } else if (snapshotUrl) {
+        player.pause();
+        player.removeAttribute('src');
+        player.load();
+        player.removeAttribute('poster');
+        snapshot.src = snapshotUrl;
+        snapshot.hidden = false;
+        player.hidden = true;
+      }
+      details.innerHTML = `
+        <div class="detail-meta">
+          <span class="detail-pill ${entry.event_type === 'DOORBELL' ? 'doorbell' : ''}">${escapeHtml(entry.event_type)}</span>
+          <span class="detail-pill">${escapeHtml(formatTime(entry.timestamp))}</span>
+          <span class="detail-pill">${escapeHtml(entry.camera_name ? entry.camera_name : activeChannelName(entry.channel))}</span>
+          ${entry.clip_status && entry.clip_status !== 'ready' ? `<span class="detail-pill">${escapeHtml(`Clip ${entry.clip_status}`)}</span>` : ''}
+        </div>
+        ${entry.message && entry.message !== entry.title ? `<div class="detail-note">${escapeHtml(entry.message)}</div>` : ''}
+      `;
+    }
+
+    function collectNotificationSettings() {
+      const next = {
+        enabled: !!document.getElementById('notificationsEnabled')?.checked,
+        app_target: (document.getElementById('appTarget')?.value || defaultNotificationPath).trim() || defaultNotificationPath,
+        default_notify_services: Array.from(document.querySelectorAll('[data-default-service]'))
+          .filter(input => input.checked)
+          .map(input => input.value),
+        cameras: [],
+      };
+
+      for (const channelInfo of state.channels) {
+        const channel = channelInfo.channel;
+        const current = notificationCamera(channel) || {};
+        const inheritDefaults = !!document.querySelector(`[data-camera-inherit="${channel}"]`)?.checked;
+        const notifyServices = inheritDefaults
+          ? []
+          : Array.from(document.querySelectorAll(`[data-camera-service="${channel}"]`))
+              .filter(input => input.checked)
+              .map(input => input.value);
+        const rules = {};
+        for (const eventType of channelAllowedEventTypes(channel)) {
+          rules[eventType] = {
+            enabled: !!document.querySelector(`[data-rule-enabled="${channel}:${eventType}"]`)?.checked,
+            cooldown_seconds: Math.max(Number.parseInt(document.querySelector(`[data-rule-cooldown="${channel}:${eventType}"]`)?.value || '0', 10) || 0, 0),
+            title_template: (document.querySelector(`[data-rule-title="${channel}:${eventType}"]`)?.value || '').trim(),
+            message_template: (document.querySelector(`[data-rule-message="${channel}:${eventType}"]`)?.value || '').trim(),
+          };
+        }
+        next.cameras.push({
+          channel,
+          camera_name: current.camera_name || channelInfo.name || `Channel ${channel}`,
+          enabled: !!document.querySelector(`[data-camera-enabled="${channel}"]`)?.checked,
+          notify_services: notifyServices,
+          rules,
+        });
+      }
+
+      state.notifications = next;
+      syncNotificationSettings();
+      return state.notifications;
+    }
+
+    async function saveNotificationSettings() {
+      try {
+        state.settingsSaving = true;
+        saveSettingsButton.disabled = true;
+        setSettingsStatus('Saving settings...');
+        const payload = collectNotificationSettings();
+        const resp = await fetch(apiUrl('api/notifications/config'), {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload),
+        });
+        const data = await resp.json();
+        if (!resp.ok) {
+          throw new Error(data.detail || `Failed to save settings (${resp.status})`);
+        }
+        state.notifications = data.settings || payload;
+        state.haStatus = data.home_assistant || state.haStatus;
+        syncNotificationSettings();
+        renderNotificationSettings();
+        setSettingsStatus('Settings saved.');
+      } catch (err) {
+        setSettingsStatus(`Save failed: ${err.message || err}`);
+      } finally {
+        state.settingsSaving = false;
+        saveSettingsButton.disabled = false;
+      }
+    }
+
+    async function sendTestNotification() {
+      const service = document.getElementById('testService')?.value || '';
+      if (!service) {
+        setSettingsStatus('Choose a notify service first.');
+        return;
+      }
+      try {
+        sendTestButton.disabled = true;
+        setSettingsStatus(`Sending test notification via ${service}...`);
+        const resp = await fetch(apiUrl('api/notifications/test'), {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ service }),
+        });
+        const data = await resp.json();
+        if (!resp.ok) {
+          throw new Error(data.detail || `Test notification failed (${resp.status})`);
+        }
+        setSettingsStatus(`Test notification sent via ${service}.`);
+      } catch (err) {
+        setSettingsStatus(`Test failed: ${err.message || err}`);
+      } finally {
+        sendTestButton.disabled = !state.haStatus?.enabled || !availableNotifyServices().length;
+      }
+    }
+
+    function openSettings() {
+      settingsShell.hidden = false;
+      document.body.style.overflow = 'hidden';
+      renderNotificationSettings();
+    }
+
+    function closeSettings() {
+      settingsShell.hidden = true;
+      document.body.style.overflow = '';
+    }
+
+    function connectSocket() {
+      const socket = new WebSocket(wsUrl('ws/events'));
+      state.socket = socket;
+      socket.onopen = () => setStatus('Live');
+      socket.onclose = () => {
+        setStatus('Reconnecting...');
+        setTimeout(connectSocket, 1500);
+      };
+      socket.onmessage = (event) => {
+        const msg = JSON.parse(event.data);
+        if (msg.type === 'hello' && Array.isArray(msg.events)) {
+          state.events = sortNewestFirst(msg.events);
+          render();
+          if (state.selected) selectEvent(state.selected, false);
+          return;
+        }
+        if (msg.type === 'event' && msg.event) {
+          state.events = sortNewestFirst([msg.event, ...state.events.filter(e => e.entry_id !== msg.event.entry_id)]);
+          state.selected = msg.event.entry_id;
+          render();
+          selectEvent(msg.event.entry_id, false);
+        }
+      };
+    }
+
+    elEvents.addEventListener('click', (ev) => {
+      const li = ev.target.closest('.event');
+      if (!li) return;
+      selectEvent(li.dataset.id, true);
+    });
+
+    elEventFilters.addEventListener('click', (ev) => {
+      const btn = ev.target.closest('[data-filter]');
+      if (!btn) return;
+      state.filter = btn.dataset.filter;
+      render();
+    });
+
+    elCameraFilters.addEventListener('click', (ev) => {
+      const btn = ev.target.closest('[data-channel-filter]');
+      if (!btn) return;
+      const value = btn.dataset.channelFilter;
+      state.channel = value === 'ALL' ? 'ALL' : Number.parseInt(value, 10);
+      render();
+    });
+
+    settingsBody.addEventListener('change', (ev) => {
+      const target = ev.target;
+      if (target.matches('[data-camera-inherit]')) {
+        const channel = target.getAttribute('data-camera-inherit');
+        const wrap = settingsBody.querySelector(`[data-camera-services-wrap="${channel}"]`);
+        if (wrap) {
+          wrap.hidden = target.checked;
+        }
+      }
+      if (target.matches('[data-camera-enabled]')) {
+        const card = target.closest('.camera-card');
+        if (card) {
+          card.classList.toggle('disabled', !target.checked);
+        }
+      }
+    });
+
+    document.getElementById('refresh').addEventListener('click', loadRecent);
+    document.getElementById('openSettings').addEventListener('click', openSettings);
+    document.getElementById('closeSettings').addEventListener('click', closeSettings);
+    saveSettingsButton.addEventListener('click', saveNotificationSettings);
+    sendTestButton.addEventListener('click', sendTestNotification);
+    settingsShell.addEventListener('click', (ev) => {
+      if (ev.target === settingsShell) {
+        closeSettings();
+      }
+    });
+    document.addEventListener('keydown', (ev) => {
+      if (ev.key === 'Escape' && !settingsShell.hidden) {
+        closeSettings();
+      }
+    });
+
+    Promise.all([loadChannels(), loadRecent(), loadNotificationConfig()]).then(() => {
+      render();
+      connectSocket();
+    }).catch(err => {
+      setStatus('Offline');
+      details.innerHTML = `<div class="empty">Failed to load recent events: ${err}</div>`;
+      setSettingsStatus(`Failed to load settings: ${err.message || err}`);
+    });
+  </script>
+</body>
+</html>"""
+
+
 @app.get("/app", response_class=HTMLResponse, summary="Open the event dashboard")
 @app.get("/app/", response_class=HTMLResponse, include_in_schema=False)
 async def app_dashboard(
@@ -2402,7 +3726,7 @@ async def app_dashboard(
         if channel is None:
             raise HTTPException(status_code=400, detail="Invalid channel")
         return HTMLResponse(_live_dashboard_html(channel=channel, event_type=event_type))
-    return HTMLResponse(_dashboard_html())
+    return HTMLResponse(_dashboard_html_v2())
 
 
 @app.websocket("/ws/events")
@@ -2453,6 +3777,11 @@ async def debug_info():
                 str(channel): _sorted_event_types(_channel_allowed_event_types(channel))
                 for channel in _sorted_channels(participating_channels)
             },
+        },
+        "home_assistant": {
+            "api_enabled": ha_client.enabled,
+            "managed_notifications_enabled": watchtower_settings.notifications.enabled,
+            "default_notify_services": watchtower_settings.notifications.default_notify_services,
         },
         "rolling_buffers": {str(channel): buffer.get_stats() for channel, buffer in rolling_buffers.items()},
         "supported_event_types": _supported_event_types(),

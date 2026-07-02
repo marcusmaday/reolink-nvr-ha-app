@@ -43,6 +43,7 @@ class StorageConfig:
     """Storage and retention configuration."""
     clips_directory: str
     index_file: str
+    settings_file: str
     retention_days: int
     max_storage_mb: int
     external_storage_path: Optional[str]
@@ -121,6 +122,7 @@ def get_config() -> AppConfig:
     base_dir = external_storage or ha_data_dir
     clips_dir = os.path.join(base_dir, "reolink_clips")
     index_file = os.path.join(base_dir, "timeline.json")
+    settings_file = os.path.join(base_dir, "watchtower_settings.json")
 
     retention_days = int(os.getenv("RETENTION_DAYS", "7"))
     max_storage_mb = int(os.getenv("MAX_STORAGE_MB", "5000"))
@@ -128,6 +130,7 @@ def get_config() -> AppConfig:
     storage_config = StorageConfig(
         clips_directory=clips_dir,
         index_file=index_file,
+        settings_file=settings_file,
         retention_days=retention_days,
         max_storage_mb=max_storage_mb,
         external_storage_path=external_storage,
@@ -149,6 +152,7 @@ def get_config() -> AppConfig:
     # ─── Create directories ───
     Path(clips_dir).mkdir(parents=True, exist_ok=True)
     Path(index_file).parent.mkdir(parents=True, exist_ok=True)
+    Path(settings_file).parent.mkdir(parents=True, exist_ok=True)
 
     config = AppConfig(
         nvr=nvr_config,
