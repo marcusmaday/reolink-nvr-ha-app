@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.4.54
+
+- Add per-camera doorbell unlock actions to Watchtower-managed notifications, including in-app settings for the button label, Home Assistant service, and target entity.
+- Add a Watchtower doorbell action page and backend execution endpoint so the notification action can run the configured Home Assistant service through the Supervisor-backed API.
+
 ## 0.4.53
 
 - Add the first in-app managed-notification settings UI so Watchtower can discover Home Assistant mobile app services, enable app-managed notifications, send a test notification, and edit per-camera event rules without leaving the app.

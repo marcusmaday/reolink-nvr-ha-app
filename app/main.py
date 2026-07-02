@@ -6,6 +6,7 @@ Camera event dashboard, clip playback, and live view for a Reolink NVR.
 
 import os
 import html
+import json
 import logging
 import asyncio
 import xml.etree.ElementTree as ET
@@ -38,6 +39,7 @@ from ha_client import HomeAssistantClient, HomeAssistantClientError
 from settings_store import (
     SUPPORTED_EVENT_TYPES,
     CameraNotificationSettings,
+    DoorbellActionSettings,
     ManagedNotificationSettings,
     NotificationRule,
     SettingsStore,
@@ -202,6 +204,11 @@ class NotificationTestRequest(BaseModel):
 class NotificationConfigResponse(BaseModel):
     settings: ManagedNotificationSettings
     home_assistant: HomeAssistantStatus
+
+
+class DoorbellActionRequest(BaseModel):
+    channel: int
+    event_id: Optional[str] = None
 
 
 class HealthCheck(BaseModel):
@@ -423,6 +430,57 @@ def _build_managed_app_event_url(entry: TimelineEntry) -> str:
     return f"{base}{separator}event_id={entry.entry_id}"
 
 
+def _camera_doorbell_action(channel: int) -> Optional[DoorbellActionSettings]:
+    camera_settings = _notification_camera_settings(channel)
+    if not camera_settings:
+        return None
+    action = camera_settings.doorbell_action
+    if not action.enabled or not action.service.strip() or not (action.entity_id or "").strip():
+        return None
+    return action
+
+
+def _build_managed_unlock_url(channel: int, entry_id: Optional[str] = None) -> str:
+    base = "/app/doorbell-action"
+    query = f"?channel={channel}"
+    if entry_id:
+        query += f"&event_id={entry_id}"
+    return f"{base}{query}"
+
+
+async def _execute_doorbell_action(channel: int, event_id: Optional[str] = None) -> dict[str, Any]:
+    if not ha_client.enabled:
+        raise HTTPException(status_code=503, detail="Home Assistant API access is not enabled for Watchtower.")
+    if not watchtower_settings.notifications.enabled:
+        raise HTTPException(status_code=409, detail="Watchtower-managed notifications are disabled.")
+
+    action = _camera_doorbell_action(channel)
+    if not action:
+        raise HTTPException(status_code=404, detail=f"No doorbell action is configured for channel {channel}.")
+
+    payload = {"entity_id": action.entity_id.strip()}
+    try:
+        await ha_client.call_service(action.service.strip(), payload)
+    except HomeAssistantClientError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+    logger.info(
+        "Executed doorbell action for channel %d via %s (%s) event=%s",
+        channel,
+        action.service,
+        action.entity_id,
+        event_id or "n/a",
+    )
+    return {
+        "status": "executed",
+        "channel": channel,
+        "service": action.service.strip(),
+        "entity_id": action.entity_id.strip(),
+        "event_id": event_id,
+        "title": action.title,
+    }
+
+
 async def _send_managed_notifications(entry: TimelineEntry) -> None:
     if not ha_client.enabled or not watchtower_settings.notifications.enabled:
         return
@@ -468,6 +526,16 @@ async def _send_managed_notifications(entry: TimelineEntry) -> None:
             ],
         },
     }
+    doorbell_action = _camera_doorbell_action(entry.channel) if entry.event_type == "DOORBELL" else None
+    if doorbell_action:
+        payload["data"]["actions"].insert(
+            0,
+            {
+                "action": "URI",
+                "title": doorbell_action.title,
+                "uri": _build_managed_unlock_url(entry.channel, entry.entry_id),
+            },
+        )
     if payload["data"]["image"] is None:
         payload["data"].pop("image", None)
 
@@ -721,7 +789,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title=APP_NAME,
     description="Camera event dashboard, clip playback, and live view for a Reolink NVR",
-    version="0.4.53",
+    version="0.4.54",
     lifespan=lifespan,
 )
 
@@ -1356,7 +1424,7 @@ async def root(request: Request):
         return HTMLResponse(_dashboard_html_v2())
     return {
         "name": APP_NAME,
-        "version": "0.4.53",
+        "version": "0.4.54",
         "status": "running",
         "docs": "/docs",
         "health": "/api/health",
@@ -1455,6 +1523,11 @@ async def send_notification_test(payload: NotificationTestRequest):
         raise HTTPException(status_code=502, detail=str(exc)) from exc
 
     return {"status": "sent", "service": payload.service}
+
+
+@app.post("/api/doorbell-action/unlock", summary="Execute a configured doorbell unlock action")
+async def execute_doorbell_unlock(payload: DoorbellActionRequest):
+    return await _execute_doorbell_action(payload.channel, payload.event_id)
 
 
 @app.get("/api/channels", response_model=List[ChannelInfo], summary="List all camera channels")
@@ -3182,6 +3255,12 @@ def _dashboard_html_v2() -> str:
           camera_name: existing.camera_name || channelInfo.name || `Channel ${channelInfo.channel}`,
           enabled: existing.enabled !== undefined ? !!existing.enabled : true,
           notify_services: Array.isArray(existing.notify_services) ? [...existing.notify_services] : [],
+          doorbell_action: {
+            enabled: !!existing.doorbell_action?.enabled,
+            title: typeof existing.doorbell_action?.title === 'string' && existing.doorbell_action.title.trim() ? existing.doorbell_action.title.trim() : 'Unlock Front Door',
+            service: typeof existing.doorbell_action?.service === 'string' && existing.doorbell_action.service.trim() ? existing.doorbell_action.service.trim() : 'lock.unlock',
+            entity_id: typeof existing.doorbell_action?.entity_id === 'string' ? existing.doorbell_action.entity_id.trim() : '',
+          },
           rules,
         };
       });
@@ -3322,6 +3401,7 @@ def _dashboard_html_v2() -> str:
           <p>Each camera can be enabled or muted independently. Event types shown here already respect Watchtower's participating-camera and allowed-event-type configuration.</p>
           ${settings.cameras.map(camera => {
             const usesDefaultServices = !camera.notify_services || camera.notify_services.length === 0;
+            const supportsDoorbell = !!camera.rules?.DOORBELL;
             const cameraRules = Object.entries(camera.rules || {}).map(([eventType, rule]) => `
               <div class="event-rule">
                 <div class="rule-row">
@@ -3369,6 +3449,30 @@ def _dashboard_html_v2() -> str:
                 </div>
 
                 <div class="event-rule-grid">${cameraRules || '<div class="settings-note">No event types are enabled for this camera.</div>'}</div>
+
+                ${supportsDoorbell ? `
+                  <div class="event-rule">
+                    <div class="rule-row">
+                      <label class="inline-check">
+                        <input type="checkbox" data-doorbell-action-enabled="${camera.channel}" ${camera.doorbell_action?.enabled ? 'checked' : ''}>
+                        <span><strong>Doorbell unlock action</strong></span>
+                      </label>
+                    </div>
+                    <div class="field">
+                      <label>Button label</label>
+                      <input type="text" data-doorbell-action-title="${camera.channel}" value="${escapeHtml(camera.doorbell_action?.title || 'Unlock Front Door')}" placeholder="Unlock Front Door">
+                    </div>
+                    <div class="field">
+                      <label>Service</label>
+                      <input type="text" data-doorbell-action-service="${camera.channel}" value="${escapeHtml(camera.doorbell_action?.service || 'lock.unlock')}" placeholder="lock.unlock">
+                    </div>
+                    <div class="field">
+                      <label>Entity ID</label>
+                      <input type="text" data-doorbell-action-entity="${camera.channel}" value="${escapeHtml(camera.doorbell_action?.entity_id || '')}" placeholder="lock.front_door">
+                    </div>
+                    <div class="settings-note">When used from a notification, this action opens a small Watchtower page and runs the configured Home Assistant service through the Supervisor-backed API.</div>
+                  </div>
+                ` : ''}
               </div>
             `;
           }).join('')}
@@ -3547,6 +3651,12 @@ def _dashboard_html_v2() -> str:
           camera_name: current.camera_name || channelInfo.name || `Channel ${channel}`,
           enabled: !!document.querySelector(`[data-camera-enabled="${channel}"]`)?.checked,
           notify_services: notifyServices,
+          doorbell_action: {
+            enabled: !!document.querySelector(`[data-doorbell-action-enabled="${channel}"]`)?.checked,
+            title: (document.querySelector(`[data-doorbell-action-title="${channel}"]`)?.value || 'Unlock Front Door').trim() || 'Unlock Front Door',
+            service: (document.querySelector(`[data-doorbell-action-service="${channel}"]`)?.value || 'lock.unlock').trim() || 'lock.unlock',
+            entity_id: (document.querySelector(`[data-doorbell-action-entity="${channel}"]`)?.value || '').trim(),
+          },
           rules,
         });
       }
@@ -3713,6 +3823,117 @@ def _dashboard_html_v2() -> str:
 </html>"""
 
 
+def _doorbell_action_html(channel: int, event_id: Optional[str] = None) -> str:
+    channel_label = html.escape(_channel_name(channel) or f"Channel {channel}")
+    return f"""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{LIVE_PAGE_TITLE} Doorbell Action</title>
+  <style>
+    :root {{
+      color-scheme: dark;
+      --bg: #0f1115;
+      --panel: #171b22;
+      --line: #263041;
+      --text: #e6edf3;
+      --muted: #9aa7b7;
+      --accent: #5aa9ff;
+      --success: #7ed6a5;
+      --danger: #ff8a80;
+    }}
+    * {{ box-sizing: border-box; }}
+    body {{
+      margin: 0;
+      min-height: 100vh;
+      display: grid;
+      place-items: center;
+      padding: 20px;
+      background: var(--bg);
+      color: var(--text);
+      font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }}
+    .card {{
+      width: min(440px, 100%);
+      border: 1px solid var(--line);
+      border-radius: 16px;
+      background: var(--panel);
+      padding: 20px;
+      display: grid;
+      gap: 14px;
+    }}
+    .status {{
+      font-size: 1.1rem;
+      font-weight: 600;
+    }}
+    .meta {{
+      color: var(--muted);
+      line-height: 1.45;
+    }}
+    .ok {{ color: var(--success); }}
+    .error {{ color: var(--danger); }}
+    .actions {{
+      display: flex;
+      gap: 10px;
+      flex-wrap: wrap;
+    }}
+    a, button {{
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      background: #12161d;
+      color: var(--text);
+      min-height: 42px;
+      padding: 10px 12px;
+      text-decoration: none;
+      font: inherit;
+      cursor: pointer;
+    }}
+  </style>
+</head>
+<body>
+  <div class="card">
+    <div class="status" id="status">Running unlock action...</div>
+    <div class="meta" id="message">Watchtower is executing the configured doorbell action for {channel_label}.</div>
+    <div class="actions">
+      <a href="/app">Back to Watchtower</a>
+      <button id="retry" type="button">Retry</button>
+    </div>
+  </div>
+  <script>
+    const payload = {{ channel: {channel}, event_id: {json.dumps(event_id)} }};
+    async function runAction() {{
+      const status = document.getElementById('status');
+      const message = document.getElementById('message');
+      status.textContent = 'Running unlock action...';
+      status.className = 'status';
+      message.textContent = 'Watchtower is executing the configured doorbell action for {channel_label}.';
+      try {{
+        const resp = await fetch('/api/doorbell-action/unlock', {{
+          method: 'POST',
+          headers: {{ 'Content-Type': 'application/json' }},
+          body: JSON.stringify(payload),
+        }});
+        const data = await resp.json();
+        if (!resp.ok) {{
+          throw new Error(data.detail || `Request failed (${{resp.status}})`);
+        }}
+        status.textContent = data.title ? `${{data.title}} sent` : 'Unlock action sent';
+        status.className = 'status ok';
+        message.textContent = `Watchtower called ${{data.service}} for ${{data.entity_id}} on {channel_label}.`;
+      }} catch (err) {{
+        status.textContent = 'Unlock action failed';
+        status.className = 'status error';
+        message.textContent = err.message || String(err);
+      }}
+    }}
+    document.getElementById('retry').addEventListener('click', runAction);
+    runAction();
+  </script>
+</body>
+</html>"""
+
+
 @app.get("/app", response_class=HTMLResponse, summary="Open the event dashboard")
 @app.get("/app/", response_class=HTMLResponse, include_in_schema=False)
 async def app_dashboard(
@@ -3727,6 +3948,19 @@ async def app_dashboard(
             raise HTTPException(status_code=400, detail="Invalid channel")
         return HTMLResponse(_live_dashboard_html(channel=channel, event_type=event_type))
     return HTMLResponse(_dashboard_html_v2())
+
+
+@app.get("/doorbell-action", response_class=HTMLResponse, summary="Execute a configured doorbell action")
+@app.get("/app/doorbell-action", response_class=HTMLResponse, include_in_schema=False)
+async def app_doorbell_action(
+    channel: int = Query(..., description="Camera channel number"),
+    event_id: Optional[str] = Query(None),
+):
+    if not _channel_is_participating(channel):
+        raise HTTPException(status_code=404, detail=f"Channel {channel} is not enabled in Watchtower.")
+    if not _camera_doorbell_action(channel):
+        raise HTTPException(status_code=404, detail=f"No doorbell action is configured for channel {channel}.")
+    return HTMLResponse(_doorbell_action_html(channel=channel, event_id=event_id))
 
 
 @app.websocket("/ws/events")

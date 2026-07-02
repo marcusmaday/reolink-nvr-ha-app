@@ -26,12 +26,20 @@ class NotificationRule(BaseModel):
     message_template: str | None = None
 
 
+class DoorbellActionSettings(BaseModel):
+    enabled: bool = False
+    title: str = "Unlock Front Door"
+    service: str = "lock.unlock"
+    entity_id: str | None = None
+
+
 class CameraNotificationSettings(BaseModel):
     channel: int
     camera_name: str | None = None
     enabled: bool = True
     notify_services: list[str] = Field(default_factory=list)
     rules: dict[str, NotificationRule] = Field(default_factory=dict)
+    doorbell_action: DoorbellActionSettings = Field(default_factory=DoorbellActionSettings)
 
 
 class ManagedNotificationSettings(BaseModel):
@@ -111,6 +119,11 @@ class SettingsStore:
                     enabled=existing.enabled if existing else True,
                     notify_services=list(existing.notify_services) if existing else [],
                     rules=rule_map,
+                    doorbell_action=(
+                        existing.doorbell_action.model_copy(deep=True)
+                        if existing and existing.doorbell_action
+                        else DoorbellActionSettings()
+                    ),
                 )
             )
 
