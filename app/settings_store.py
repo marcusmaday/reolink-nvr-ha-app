@@ -33,6 +33,14 @@ class DoorbellActionSettings(BaseModel):
     entity_id: str | None = None
 
 
+class HomeAssistantCameraSourceSettings(BaseModel):
+    person_entity_id: str | None = None
+    doorbell_entity_id: str | None = None
+    animal_entity_id: str | None = None
+    vehicle_entity_id: str | None = None
+    snapshot_camera_entity_id: str | None = None
+
+
 class CameraNotificationSettings(BaseModel):
     channel: int
     camera_name: str | None = None
@@ -40,12 +48,14 @@ class CameraNotificationSettings(BaseModel):
     notify_services: list[str] = Field(default_factory=list)
     rules: dict[str, NotificationRule] = Field(default_factory=dict)
     doorbell_action: DoorbellActionSettings = Field(default_factory=DoorbellActionSettings)
+    ha_source: HomeAssistantCameraSourceSettings = Field(default_factory=HomeAssistantCameraSourceSettings)
 
 
 class ManagedNotificationSettings(BaseModel):
     enabled: bool = False
     app_target: str = "/app/15e0e6e5_watchtower"
     default_notify_services: list[str] = Field(default_factory=list)
+    preferred_test_service: str | None = None
     cameras: list[CameraNotificationSettings] = Field(default_factory=list)
 
 
@@ -123,6 +133,11 @@ class SettingsStore:
                         existing.doorbell_action.model_copy(deep=True)
                         if existing and existing.doorbell_action
                         else DoorbellActionSettings()
+                    ),
+                    ha_source=(
+                        existing.ha_source.model_copy(deep=True)
+                        if existing and existing.ha_source
+                        else HomeAssistantCameraSourceSettings()
                     ),
                 )
             )

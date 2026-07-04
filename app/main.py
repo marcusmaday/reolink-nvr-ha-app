@@ -36,10 +36,12 @@ from storage_manager import StorageManager
 from rolling_buffer import RollingSegmentBuffer
 from reolink_search import search_recordings, get_channels_info, EVENT_TYPE_MAP
 from ha_client import HomeAssistantClient, HomeAssistantClientError
+from ha_ws_listener import HomeAssistantWebSocketListener
 from settings_store import (
     SUPPORTED_EVENT_TYPES,
     CameraNotificationSettings,
     DoorbellActionSettings,
+    HomeAssistantCameraSourceSettings,
     ManagedNotificationSettings,
     NotificationRule,
     SettingsStore,
@@ -138,6 +140,9 @@ settings_store: Optional[SettingsStore] = None
 watchtower_settings: WatchtowerSettings = WatchtowerSettings()
 ha_client = HomeAssistantClient(supervisor_token=os.getenv("SUPERVISOR_TOKEN"))
 notification_delivery_history: dict[tuple[int, str], datetime] = {}
+ha_ws_listener_task: Optional[asyncio.Task] = None
+ha_ws_listener: Optional[HomeAssistantWebSocketListener] = None
+ha_state_event_history: dict[str, datetime] = {}
 
 
 # ─── Pydantic models ──────────────────────────────────────────────────────────
@@ -193,6 +198,19 @@ class CameraSelectionInfo(BaseModel):
 class HomeAssistantStatus(BaseModel):
     enabled: bool
     discovered_mobile_notify_services: list[str] = Field(default_factory=list)
+    websocket_listener_running: bool = False
+
+
+class HomeAssistantEntitySummary(BaseModel):
+    entity_id: str
+    friendly_name: str
+    domain: str
+    state: str
+
+
+class HomeAssistantEntityCatalog(BaseModel):
+    binary_sensors: list[HomeAssistantEntitySummary] = Field(default_factory=list)
+    cameras: list[HomeAssistantEntitySummary] = Field(default_factory=list)
 
 
 class NotificationTestRequest(BaseModel):
@@ -405,6 +423,73 @@ def _notification_camera_settings(channel: int) -> Optional[CameraNotificationSe
     return None
 
 
+def _default_event_title_message(event_type: str, camera_name: str) -> tuple[str, str]:
+    if event_type == "DOORBELL":
+        return "Doorbell", "Someone is at the door."
+    if event_type == "PERSON":
+        return "Person Detected", f"Person detected at {camera_name}."
+    if event_type == "ANIMAL":
+        return "Animal Detected", f"Animal detected at {camera_name}."
+    if event_type == "VEHICLE":
+        return "Vehicle Detected", f"Vehicle detected at {camera_name}."
+    return f"{event_type.title()} Detected", f"{event_type.title()} detected at {camera_name}."
+
+
+def _camera_ha_source_settings(channel: int) -> Optional[HomeAssistantCameraSourceSettings]:
+    camera_settings = _notification_camera_settings(channel)
+    if not camera_settings:
+        return None
+    return camera_settings.ha_source
+
+
+def _entity_mapping_for_state_change(entity_id: str) -> Optional[tuple[int, str]]:
+    normalized = (entity_id or "").strip().lower()
+    if not normalized:
+        return None
+
+    for channel in _sorted_channels(participating_channels):
+        source = _camera_ha_source_settings(channel)
+        if not source:
+            continue
+        mappings = {
+            "PERSON": source.person_entity_id,
+            "DOORBELL": source.doorbell_entity_id,
+            "ANIMAL": source.animal_entity_id,
+            "VEHICLE": source.vehicle_entity_id,
+        }
+        for event_type, mapped_entity_id in mappings.items():
+            if (mapped_entity_id or "").strip().lower() == normalized:
+                return channel, event_type
+    return None
+
+
+async def _capture_snapshot_for_channel(channel: int, event_type: str, event_timestamp: datetime) -> Optional[str]:
+    source = _camera_ha_source_settings(channel)
+    snapshot_camera_entity_id = (source.snapshot_camera_entity_id or "").strip() if source else ""
+    if not snapshot_camera_entity_id:
+        return None
+
+    file_stamp = event_timestamp.strftime("%Y%m%dT%H%M%S")
+    file_name = f"watchtower_{channel}_{event_type.lower()}_{file_stamp}.jpg"
+    snapshot_file = f"/config/www/tmp/{file_name}"
+    snapshot_url = f"/local/tmp/{file_name}"
+
+    try:
+        await ha_client.call_service(
+            "camera.snapshot",
+            {
+                "entity_id": snapshot_camera_entity_id,
+                "filename": snapshot_file,
+            },
+        )
+        await asyncio.sleep(0.5)
+    except HomeAssistantClientError as exc:
+        logger.warning("Failed to capture Home Assistant snapshot for channel %d: %s", channel, exc)
+        return None
+
+    return snapshot_url
+
+
 def _render_notification_text(template: Optional[str], fallback: str, *, entry: TimelineEntry) -> str:
     if not template:
         return fallback
@@ -550,6 +635,88 @@ async def _send_managed_notifications(entry: TimelineEntry) -> None:
     logger.info("Managed notifications sent for %s via %s", entry.entry_id, notify_services)
 
 
+async def _handle_ha_state_changed(event: dict[str, Any]) -> None:
+    event_data = event.get("data") or {}
+    entity_id = event_data.get("entity_id")
+    mapping = _entity_mapping_for_state_change(entity_id or "")
+    if not mapping:
+        return
+
+    new_state = event_data.get("new_state") or {}
+    old_state = event_data.get("old_state") or {}
+    if str(new_state.get("state")).lower() != "on":
+        return
+    if str(old_state.get("state")).lower() == "on":
+        return
+
+    channel, event_type = mapping
+    if not _channel_is_participating(channel) or not _channel_allows_event_type(channel, event_type):
+        return
+
+    try:
+        event_timestamp_raw = new_state.get("last_changed") or event.get("time_fired")
+        event_timestamp = datetime.fromisoformat(str(event_timestamp_raw).replace("Z", "+00:00"))
+    except Exception:
+        event_timestamp = datetime.now(timezone.utc)
+
+    history_key = f"{entity_id}:{new_state.get('state')}:{event_type}"
+    last_seen = ha_state_event_history.get(history_key)
+    if last_seen and abs((event_timestamp - last_seen).total_seconds()) < EVENT_DEDUPE_WINDOW_SECONDS:
+        return
+    ha_state_event_history[history_key] = event_timestamp
+
+    camera_name = _channel_name(channel) or f"Channel {channel}"
+    title, message = _default_event_title_message(event_type, camera_name)
+    snapshot_url = await _capture_snapshot_for_channel(channel, event_type, event_timestamp)
+
+    entry, created = _create_event_entry(
+        channel=channel,
+        event_type=event_type,
+        timestamp=event_timestamp,
+        camera_name=camera_name,
+        source="home_assistant_ws",
+        title=title,
+        message=message,
+        snapshot_url=snapshot_url,
+    )
+    await _broadcast_recent_event(entry)
+    if created:
+        _schedule_clip_generation(entry)
+        asyncio.create_task(_send_managed_notifications(entry))
+
+
+async def _start_ha_ws_listener() -> None:
+    global ha_ws_listener_task, ha_ws_listener
+    if not ha_client.enabled or not ha_client.access_token:
+        return
+    if ha_ws_listener_task and not ha_ws_listener_task.done():
+        return
+
+    ha_ws_listener = HomeAssistantWebSocketListener(
+        websocket_url=ha_client.websocket_url,
+        access_token=ha_client.access_token,
+        on_state_changed=_handle_ha_state_changed,
+    )
+    ha_ws_listener_task = asyncio.create_task(ha_ws_listener.run_forever(), name="ha-ws-listener")
+    logger.info("Home Assistant WebSocket listener task started")
+
+
+async def _stop_ha_ws_listener() -> None:
+    global ha_ws_listener_task, ha_ws_listener
+    if ha_ws_listener:
+        ha_ws_listener.stop()
+    if ha_ws_listener_task:
+        ha_ws_listener_task.cancel()
+        try:
+            await ha_ws_listener_task
+        except asyncio.CancelledError:
+            pass
+        except Exception as exc:
+            logger.warning("Error while stopping Home Assistant WebSocket listener: %s", exc)
+    ha_ws_listener_task = None
+    ha_ws_listener = None
+
+
 def _resolve_ingest_channel(payload_channel: int, camera_name: Optional[str]) -> int:
     normalized_name = _normalize_camera_name(camera_name)
 
@@ -617,6 +784,36 @@ def _channel_info_payload(channel_info: dict[str, Any]) -> ChannelInfo:
         default_live=channel == default_live_channel,
         allowed_event_types=_sorted_event_types(_channel_allowed_event_types(channel)) if channel in participating_channels else [],
     )
+
+
+async def _load_home_assistant_entity_catalog() -> HomeAssistantEntityCatalog:
+    if not ha_client.enabled:
+        return HomeAssistantEntityCatalog()
+
+    states = await ha_client.get_states()
+    binary_sensors: list[HomeAssistantEntitySummary] = []
+    cameras: list[HomeAssistantEntitySummary] = []
+
+    for state in states:
+        entity_id = str(state.get("entity_id") or "").strip()
+        if "." not in entity_id:
+            continue
+        domain = entity_id.split(".", 1)[0]
+        friendly_name = str((state.get("attributes") or {}).get("friendly_name") or entity_id)
+        summary = HomeAssistantEntitySummary(
+            entity_id=entity_id,
+            friendly_name=friendly_name,
+            domain=domain,
+            state=str(state.get("state") or ""),
+        )
+        if domain == "binary_sensor":
+            binary_sensors.append(summary)
+        elif domain == "camera":
+            cameras.append(summary)
+
+    binary_sensors.sort(key=lambda item: (item.friendly_name.casefold(), item.entity_id))
+    cameras.sort(key=lambda item: (item.friendly_name.casefold(), item.entity_id))
+    return HomeAssistantEntityCatalog(binary_sensors=binary_sensors, cameras=cameras)
 
 
 async def _rolling_buffer_monitor_loop() -> None:
@@ -757,9 +954,12 @@ async def lifespan(app: FastAPI):
     if rolling_buffers:
         rolling_buffer_monitor_task = asyncio.create_task(_rolling_buffer_monitor_loop())
 
+    await _start_ha_ws_listener()
+
     yield  # ← app runs here
 
     logger.info("Shutting down Watchtower...")
+    await _stop_ha_ws_listener()
     if rolling_buffer_monitor_task:
         rolling_buffer_monitor_task.cancel()
         try:
@@ -789,7 +989,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title=APP_NAME,
     description="Camera event dashboard, clip playback, and live view for a Reolink NVR",
-    version="0.4.54",
+    version="0.4.57",
     lifespan=lifespan,
 )
 
@@ -1424,7 +1624,7 @@ async def root(request: Request):
         return HTMLResponse(_dashboard_html_v2())
     return {
         "name": APP_NAME,
-        "version": "0.4.54",
+        "version": "0.4.57",
         "status": "running",
         "docs": "/docs",
         "health": "/api/health",
@@ -1476,7 +1676,15 @@ async def get_home_assistant_status():
     return HomeAssistantStatus(
         enabled=ha_client.enabled,
         discovered_mobile_notify_services=services,
+        websocket_listener_running=bool(ha_ws_listener_task and not ha_ws_listener_task.done()),
     )
+
+
+@app.get("/api/home-assistant/entities", response_model=HomeAssistantEntityCatalog, summary="Discover Home Assistant entities for Watchtower")
+async def get_home_assistant_entities():
+    if not ha_client.enabled:
+        raise HTTPException(status_code=503, detail="Home Assistant API access is not enabled for Watchtower.")
+    return await _load_home_assistant_entity_catalog()
 
 
 @app.get("/api/notifications/config", response_model=NotificationConfigResponse, summary="Managed notification settings")
@@ -1487,6 +1695,7 @@ async def get_notification_config():
         home_assistant=HomeAssistantStatus(
             enabled=ha_client.enabled,
             discovered_mobile_notify_services=services,
+            websocket_listener_running=bool(ha_ws_listener_task and not ha_ws_listener_task.done()),
         ),
     )
 
@@ -1502,6 +1711,7 @@ async def update_notification_config(settings: ManagedNotificationSettings):
         home_assistant=HomeAssistantStatus(
             enabled=ha_client.enabled,
             discovered_mobile_notify_services=services,
+            websocket_listener_running=bool(ha_ws_listener_task and not ha_ws_listener_task.done()),
         ),
     )
 
@@ -3128,6 +3338,7 @@ def _dashboard_html_v2() -> str:
       defaultLiveChannel: null,
       notifications: null,
       haStatus: null,
+      haEntities: { binary_sensors: [], cameras: [] },
       settingsLoaded: false,
       settingsSaving: false,
     };
@@ -3228,6 +3439,7 @@ def _dashboard_html_v2() -> str:
         enabled: false,
         app_target: defaultNotificationPath,
         default_notify_services: [],
+        preferred_test_service: '',
         cameras: [],
       };
     }
@@ -3261,6 +3473,13 @@ def _dashboard_html_v2() -> str:
             service: typeof existing.doorbell_action?.service === 'string' && existing.doorbell_action.service.trim() ? existing.doorbell_action.service.trim() : 'lock.unlock',
             entity_id: typeof existing.doorbell_action?.entity_id === 'string' ? existing.doorbell_action.entity_id.trim() : '',
           },
+          ha_source: {
+            person_entity_id: typeof existing.ha_source?.person_entity_id === 'string' ? existing.ha_source.person_entity_id.trim() : '',
+            doorbell_entity_id: typeof existing.ha_source?.doorbell_entity_id === 'string' ? existing.ha_source.doorbell_entity_id.trim() : '',
+            animal_entity_id: typeof existing.ha_source?.animal_entity_id === 'string' ? existing.ha_source.animal_entity_id.trim() : '',
+            vehicle_entity_id: typeof existing.ha_source?.vehicle_entity_id === 'string' ? existing.ha_source.vehicle_entity_id.trim() : '',
+            snapshot_camera_entity_id: typeof existing.ha_source?.snapshot_camera_entity_id === 'string' ? existing.ha_source.snapshot_camera_entity_id.trim() : '',
+          },
           rules,
         };
       });
@@ -3268,6 +3487,7 @@ def _dashboard_html_v2() -> str:
         enabled: !!base.enabled,
         app_target: typeof base.app_target === 'string' && base.app_target.trim() ? base.app_target.trim() : defaultNotificationPath,
         default_notify_services: Array.isArray(base.default_notify_services) ? [...base.default_notify_services] : [],
+        preferred_test_service: typeof base.preferred_test_service === 'string' ? base.preferred_test_service.trim() : '',
         cameras: syncedCameras,
       };
     }
@@ -3293,6 +3513,12 @@ def _dashboard_html_v2() -> str:
           </span>
         </label>
       `).join('')}</div>`;
+    }
+
+    function entityOptions(entities) {
+      return (entities || []).map(entity => `
+        <option value="${escapeHtml(entity.entity_id)}">${escapeHtml(entity.friendly_name)} (${escapeHtml(entity.entity_id)})</option>
+      `).join('');
     }
 
     function renderEventFilters() {
@@ -3352,9 +3578,13 @@ def _dashboard_html_v2() -> str:
 
       const settings = state.notifications;
       const discoveredServices = availableNotifyServices();
+      const binarySensorOptions = entityOptions(state.haEntities.binary_sensors);
+      const cameraOptions = entityOptions(state.haEntities.cameras);
       const testServiceOptions = discoveredServices.map(service => `<option value="${escapeHtml(service)}">${escapeHtml(service)}</option>`).join('');
 
       settingsBody.innerHTML = `
+        <datalist id="haBinarySensorOptions">${binarySensorOptions}</datalist>
+        <datalist id="haCameraOptions">${cameraOptions}</datalist>
         <div class="settings-card">
           <div class="row">
             <h3>Home Assistant Connection</h3>
@@ -3364,6 +3594,10 @@ def _dashboard_html_v2() -> str:
           <div class="field">
             <label>Discovered Mobile App Services</label>
             <div class="settings-note">${discoveredServices.length ? escapeHtml(discoveredServices.join(', ')) : 'None discovered yet.'}</div>
+          </div>
+          <div class="field">
+            <label>Direct Event Listener</label>
+            <div class="settings-note">${state.haStatus?.websocket_listener_running ? 'Running and listening for Home Assistant state changes.' : 'Not connected yet. Watchtower will retry automatically while the add-on is running.'}</div>
           </div>
         </div>
 
@@ -3448,6 +3682,31 @@ def _dashboard_html_v2() -> str:
                   <div class="service-note">Leave all camera-specific services unchecked if you want to switch this camera back to the default list.</div>
                 </div>
 
+                <div class="event-rule">
+                  <h4>Home Assistant Event Sources</h4>
+                  <div class="field">
+                    <label>Person sensor</label>
+                    <input type="text" list="haBinarySensorOptions" data-ha-person="${camera.channel}" value="${escapeHtml(camera.ha_source?.person_entity_id || '')}" placeholder="binary_sensor.front_door_person">
+                  </div>
+                  <div class="field">
+                    <label>Doorbell sensor</label>
+                    <input type="text" list="haBinarySensorOptions" data-ha-doorbell="${camera.channel}" value="${escapeHtml(camera.ha_source?.doorbell_entity_id || '')}" placeholder="binary_sensor.front_door_visitor">
+                  </div>
+                  <div class="field">
+                    <label>Animal sensor</label>
+                    <input type="text" list="haBinarySensorOptions" data-ha-animal="${camera.channel}" value="${escapeHtml(camera.ha_source?.animal_entity_id || '')}" placeholder="binary_sensor.backyard_animal">
+                  </div>
+                  <div class="field">
+                    <label>Vehicle sensor</label>
+                    <input type="text" list="haBinarySensorOptions" data-ha-vehicle="${camera.channel}" value="${escapeHtml(camera.ha_source?.vehicle_entity_id || '')}" placeholder="binary_sensor.driveway_vehicle">
+                  </div>
+                  <div class="field">
+                    <label>Snapshot camera</label>
+                    <input type="text" list="haCameraOptions" data-ha-snapshot-camera="${camera.channel}" value="${escapeHtml(camera.ha_source?.snapshot_camera_entity_id || '')}" placeholder="camera.front_door_fluent">
+                  </div>
+                  <div class="settings-note">Watchtower listens directly to these Home Assistant entities over the websocket API. Leave any field blank if that event type does not apply to this camera.</div>
+                </div>
+
                 <div class="event-rule-grid">${cameraRules || '<div class="settings-note">No event types are enabled for this camera.</div>'}</div>
 
                 ${supportsDoorbell ? `
@@ -3479,7 +3738,7 @@ def _dashboard_html_v2() -> str:
         </div>
       `;
 
-      const firstService = settings.default_notify_services?.[0] || discoveredServices[0] || '';
+      const firstService = settings.preferred_test_service || settings.default_notify_services?.[0] || discoveredServices[0] || '';
       const testServiceSelect = document.getElementById('testService');
       if (testServiceSelect && firstService) {
         testServiceSelect.value = firstService;
@@ -3567,6 +3826,23 @@ def _dashboard_html_v2() -> str:
       setSettingsStatus(state.haStatus.enabled ? 'Ready to configure managed notifications.' : 'Home Assistant API access is unavailable. Settings can still be saved.');
     }
 
+    async function loadHomeAssistantEntities() {
+      try {
+        const resp = await fetch(apiUrl('api/home-assistant/entities'), { cache: 'no-store' });
+        if (!resp.ok) {
+          state.haEntities = { binary_sensors: [], cameras: [] };
+          return;
+        }
+        const data = await resp.json();
+        state.haEntities = {
+          binary_sensors: Array.isArray(data.binary_sensors) ? data.binary_sensors : [],
+          cameras: Array.isArray(data.cameras) ? data.cameras : [],
+        };
+      } catch (err) {
+        state.haEntities = { binary_sensors: [], cameras: [] };
+      }
+    }
+
     async function loadRequestedEvent() {
       if (!requestedEventId) return null;
       const existing = state.events.find(e => e.entry_id === requestedEventId);
@@ -3625,6 +3901,7 @@ def _dashboard_html_v2() -> str:
         default_notify_services: Array.from(document.querySelectorAll('[data-default-service]'))
           .filter(input => input.checked)
           .map(input => input.value),
+        preferred_test_service: (document.getElementById('testService')?.value || '').trim(),
         cameras: [],
       };
 
@@ -3656,6 +3933,13 @@ def _dashboard_html_v2() -> str:
             title: (document.querySelector(`[data-doorbell-action-title="${channel}"]`)?.value || 'Unlock Front Door').trim() || 'Unlock Front Door',
             service: (document.querySelector(`[data-doorbell-action-service="${channel}"]`)?.value || 'lock.unlock').trim() || 'lock.unlock',
             entity_id: (document.querySelector(`[data-doorbell-action-entity="${channel}"]`)?.value || '').trim(),
+          },
+          ha_source: {
+            person_entity_id: (document.querySelector(`[data-ha-person="${channel}"]`)?.value || '').trim(),
+            doorbell_entity_id: (document.querySelector(`[data-ha-doorbell="${channel}"]`)?.value || '').trim(),
+            animal_entity_id: (document.querySelector(`[data-ha-animal="${channel}"]`)?.value || '').trim(),
+            vehicle_entity_id: (document.querySelector(`[data-ha-vehicle="${channel}"]`)?.value || '').trim(),
+            snapshot_camera_entity_id: (document.querySelector(`[data-ha-snapshot-camera="${channel}"]`)?.value || '').trim(),
           },
           rules,
         });
@@ -3810,7 +4094,7 @@ def _dashboard_html_v2() -> str:
       }
     });
 
-    Promise.all([loadChannels(), loadRecent(), loadNotificationConfig()]).then(() => {
+    Promise.all([loadChannels(), loadRecent(), loadNotificationConfig(), loadHomeAssistantEntities()]).then(() => {
       render();
       connectSocket();
     }).catch(err => {
@@ -4014,6 +4298,7 @@ async def debug_info():
         },
         "home_assistant": {
             "api_enabled": ha_client.enabled,
+            "websocket_listener_running": bool(ha_ws_listener_task and not ha_ws_listener_task.done()),
             "managed_notifications_enabled": watchtower_settings.notifications.enabled,
             "default_notify_services": watchtower_settings.notifications.default_notify_services,
         },

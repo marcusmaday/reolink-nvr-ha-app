@@ -67,48 +67,39 @@ After the add-on starts, verify:
 - `/api/device/info` shows your NVR
 - the app dashboard opens from Home Assistant
 
-## 4. Import The Notification Blueprint
+## 4. Configure Home Assistant Event Sources In Watchtower
 
-Import this blueprint into Home Assistant:
+Open Watchtower and configure the Home Assistant side directly inside the app:
+
+- map each Watchtower camera to its Home Assistant entities:
+  - person sensor
+  - doorbell sensor
+  - animal sensor
+  - vehicle sensor
+  - optional snapshot camera
+- choose your Home Assistant mobile app notify services
+- set per-camera event rules and cooldowns
+- optionally enable doorbell unlock actions
+
+Watchtower listens to those entities over the Home Assistant websocket API and
+uses the optional snapshot camera to capture notification thumbnails with
+`camera.snapshot`.
+
+If you previously used the blueprint + `rest_command` relay, disable those
+automations once the direct listener is working to avoid duplicate events or
+notifications.
+
+## 5. Optional Fallback: Blueprint Relay
+
+If you prefer the older Home Assistant automation path, Watchtower still ships
+with a fallback blueprint:
 
 ```text
 https://raw.githubusercontent.com/marcusmaday/reolink-nvr-watchtower/main/blueprints/automation/watchtower_notification.yaml
 ```
 
-Then create an automation from the blueprint and choose:
-
-1. Optional doorbell sensors
-2. Your person sensor
-3. Optional animal sensors
-4. Optional vehicle sensors
-5. Your snapshot camera
-6. Optional unlock action for the doorbell camera
-7. Your two mobile app notify services, such as `notify.mobile_app_pixel_8_pro`
-8. Your app navigation path or URL
-
-Recommended value:
-
-```text
-/app/15e0e6e5_watchtower
-```
-
-The blueprint converts that to a `homeassistant://navigate/...` mobile deep link so it works from the Home Assistant companion app even when you are away from your local Wi-Fi.
-
-The blueprint handles:
-
-- snapshot thumbnails
-- relay into the Watchtower timeline
-- `PERSON`, `DOORBELL`, optional `ANIMAL`, and optional `VEHICLE` notifications for that camera
-- tap-to-open event clips
-- tap-to-open live view
-- optional unlock actions for doorbell notifications
-- direct mobile app notifications with images, deep links, and notification actions
-
-## 5. Add The Relay Command To Home Assistant
-
-Home Assistant needs one `rest_command` block in `configuration.yaml` so it can relay events into the app timeline.
-
-Use the internal Home Assistant gateway address and the add-on port:
+That path also requires the `rest_command.reolink_ingest_event` block shown
+below:
 
 ```yaml
 rest_command:
@@ -123,8 +114,6 @@ rest_command:
         "channel": {{ channel }},
         "timestamp": "{{ timestamp }}",
         "camera_name": "{{ camera_name }}",
-        "snapshot_url": "{{ snapshot_url }}",
-        "live_url": "{{ live_url }}",
         "title": "{{ title }}",
         "message": "{{ message }}",
         "source": "home_assistant"
@@ -137,13 +126,7 @@ Find `HA_GATEWAY_IP` from the add-on shell:
 ip route | awk '/default/ {print $3}'
 ```
 
-`APP_PORT` is the add-on port you configured. It defaults to `5000`.
-
-Watchtower stores NVR channels internally as zero-based indexes. Reolink commonly labels those same channels as `1-12` in the UI while Watchtower addresses them as `0-11`, so the value used in notification automations should usually be `labeled channel - 1`.
-
-Keep sending `camera_name` in the payload as well so Watchtower can reconcile the event to the correct camera automatically if a channel mapping is ever off.
-
-After adding the block, restart Home Assistant Core or reload the automation if you already had the command in place.
+`APP_PORT` defaults to `5000`.
 
 ## 6. Open The App On Mobile
 
@@ -156,6 +139,6 @@ The app is designed for the Home Assistant companion app and remote access throu
 
 ## Common Issues
 
-- If the app opens but shows no events, check that `rest_command.reolink_ingest_event` is present and that Home Assistant was restarted.
+- If the app opens but shows no events, check the Home Assistant entity mapping inside Watchtower first.
 - If clips are too late, make sure the add-on is updated and the buffer settings are not still at their smallest values.
-- If notifications open a browser login page, use the `homeassistant://navigate/...` link style from the blueprint.
+- If notifications are missing or misrouted, check the Watchtower in-app notification settings instead of the Home Assistant blueprint.

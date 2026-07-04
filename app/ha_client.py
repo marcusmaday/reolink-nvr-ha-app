@@ -32,6 +32,18 @@ class HomeAssistantClient:
     def enabled(self) -> bool:
         return bool(self._supervisor_token)
 
+    @property
+    def access_token(self) -> str:
+        return self._supervisor_token
+
+    @property
+    def websocket_url(self) -> str:
+        if self._base_url.startswith("http://"):
+            return "ws://" + self._base_url[len("http://"):] + "/websocket"
+        if self._base_url.startswith("https://"):
+            return "wss://" + self._base_url[len("https://"):] + "/websocket"
+        return self._base_url + "/websocket"
+
     async def list_mobile_app_notify_services(self) -> list[str]:
         if not self.enabled:
             return []
@@ -63,6 +75,12 @@ class HomeAssistantClient:
             raise HomeAssistantClientError(f"Invalid Home Assistant service '{service_name}'")
 
         return await self._request("POST", f"/services/{domain}/{service}", json=payload)
+
+    async def get_states(self) -> list[dict[str, Any]]:
+        if not self.enabled:
+            return []
+        result = await self._request("GET", "/states")
+        return result if isinstance(result, list) else []
 
     async def _request(self, method: str, path: str, json: dict[str, Any] | None = None) -> Any:
         if not self.enabled:

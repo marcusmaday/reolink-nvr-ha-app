@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.4.57
+
+- Add direct Home Assistant websocket event listening with per-camera entity mapping in the Watchtower settings UI, so Watchtower can react to Reolink-related Home Assistant sensors without relying on a blueprint relay.
+- Add optional Home Assistant snapshot camera selection per Watchtower camera so websocket-driven notifications can still include thumbnail images.
+
+## 0.4.56
+
+- Replace the Home Assistant notification blueprint with a lean event-forwarder-only version so Watchtower fully owns notification delivery, cooldowns, deep links, and doorbell unlock actions.
+- Remove the blueprint's snapshot capture and direct notification steps to simplify Home Assistant setup.
+
+## 0.4.55
+
+- Persist the Watchtower settings panel's preferred test notification service so the selected device no longer snaps back to the first discovered or default notify target after saving or reopening settings.
+
 ## 0.4.54
 
 - Add per-camera doorbell unlock actions to Watchtower-managed notifications, including in-app settings for the button label, Home Assistant service, and target entity.
