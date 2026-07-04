@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.5.2
+
+- Add clearer AI-enrichment logging so it is obvious whether enrichment was skipped because of missing API credentials, per-camera AI settings, missing snapshot files, or request failures.
+- Wait briefly for newly captured snapshot files before deciding AI enrichment cannot run, which makes the enrichment path more reliable right after event-triggered snapshot capture.
+
 ## 0.5.1
 
 - Fix the Home Assistant websocket listener so it correctly handles coalesced message batches instead of crashing on `list` payloads and silently breaking event-driven notifications.

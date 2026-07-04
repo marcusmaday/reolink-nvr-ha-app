@@ -529,6 +529,14 @@ def _snapshot_url_to_local_path(snapshot_url: Optional[str]) -> Optional[Path]:
     return None
 
 
+async def _wait_for_snapshot_path(snapshot_path: Path, *, attempts: int = 5, delay_seconds: float = 0.2) -> bool:
+    for _ in range(max(attempts, 1)):
+        if snapshot_path.exists():
+            return True
+        await asyncio.sleep(max(delay_seconds, 0.05))
+    return snapshot_path.exists()
+
+
 def _compose_enriched_notification_message(
     *,
     enrichment: NotificationEnrichmentResult,
@@ -712,29 +720,50 @@ async def _execute_doorbell_action(channel: int, event_id: Optional[str] = None)
 async def _maybe_enrich_notification(entry: TimelineEntry) -> tuple[Optional[str], dict[str, str]]:
     settings = _ai_settings()
     if not settings.enabled:
+        logger.debug("AI enrichment skipped for %s: globally disabled", entry.entry_id)
         return None, {}
     if settings.provider.strip().lower() != "openai":
+        logger.info("AI enrichment skipped for %s: unsupported provider '%s'", entry.entry_id, settings.provider)
         return None, {}
     if not _event_supports_ai(entry.event_type):
+        logger.debug("AI enrichment skipped for %s: unsupported event type %s", entry.entry_id, entry.event_type)
         return None, {}
     if not _ai_daily_cap_remaining():
+        logger.info("AI enrichment skipped for %s: daily cap reached", entry.entry_id)
         return None, {}
 
     camera_ai = _camera_ai_settings(entry.channel)
     if not camera_ai or not camera_ai.enabled or entry.event_type not in (camera_ai.event_types or []):
+        logger.info(
+            "AI enrichment skipped for %s: camera %d is not configured for AI on %s",
+            entry.entry_id,
+            entry.channel,
+            entry.event_type,
+        )
         return None, {}
 
     api_key = _ai_api_key()
     if not api_key:
+        logger.info("AI enrichment skipped for %s: no OpenAI API key configured", entry.entry_id)
         return None, {}
 
     metadata = entry.metadata or {}
     snapshot_path = _snapshot_url_to_local_path(metadata.get("snapshot_url") or entry.thumbnail_path)
-    if not snapshot_path or not snapshot_path.exists():
+    if not snapshot_path:
+        logger.info("AI enrichment skipped for %s: no snapshot path available", entry.entry_id)
+        return None, {}
+    if not await _wait_for_snapshot_path(snapshot_path):
+        logger.info("AI enrichment skipped for %s: snapshot file not found at %s", entry.entry_id, snapshot_path)
         return None, {}
 
     known_subjects = _filtered_known_subjects(entry.channel, entry.event_type)
     camera_name = metadata.get("camera_name") or _channel_name(entry.channel) or f"Channel {entry.channel}"
+    logger.info(
+        "Attempting AI enrichment for %s with model %s and %d known subject(s)",
+        entry.entry_id,
+        settings.model.strip() or "gpt-4.1-mini",
+        len(known_subjects),
+    )
 
     try:
         _record_ai_enrichment_attempt()
@@ -759,6 +788,12 @@ async def _maybe_enrich_notification(entry: TimelineEntry) -> tuple[Optional[str
         enrichment=enrichment,
         confidence_threshold=max(min(float(settings.confidence_threshold), 1.0), 0.0),
         include_fun_summary=settings.include_fun_summary and settings.fun_style != "off",
+    )
+    logger.info(
+        "AI enrichment completed for %s: known_subject=%s primary_subject=%s",
+        entry.entry_id,
+        (enrichment.known_subject_name or "unknown").strip() or "unknown",
+        (enrichment.primary_subject or "unknown").strip() or "unknown",
     )
     return message, context
 
@@ -1197,7 +1232,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title=APP_NAME,
     description="Camera event dashboard, clip playback, and live view for a Reolink NVR",
-    version="0.5.1",
+    version="0.5.2",
     lifespan=lifespan,
 )
 
@@ -1832,7 +1867,7 @@ async def root(request: Request):
         return HTMLResponse(_dashboard_html_v2())
     return {
         "name": APP_NAME,
-        "version": "0.5.1",
+        "version": "0.5.2",
         "status": "running",
         "docs": "/docs",
         "health": "/api/health",
