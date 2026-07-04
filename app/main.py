@@ -537,7 +537,7 @@ async def _wait_for_snapshot_path(snapshot_path: Path, *, attempts: int = 5, del
     return snapshot_path.exists()
 
 
-async def _load_snapshot_bytes(snapshot_url: Optional[str]) -> tuple[Optional[bytes], Optional[str]]:
+async def _load_snapshot_bytes(channel: int, snapshot_url: Optional[str]) -> tuple[Optional[bytes], Optional[str]]:
     raw = (snapshot_url or "").strip()
     if not raw:
         return None, None
@@ -553,6 +553,25 @@ async def _load_snapshot_bytes(snapshot_url: Optional[str]) -> tuple[Optional[by
                 return binary, Path(raw).name
         except HomeAssistantClientError as exc:
             logger.info("Failed to fetch snapshot bytes for AI from Home Assistant at %s: %s", raw, exc)
+
+    source = _camera_ha_source_settings(channel)
+    snapshot_camera_entity_id = (source.snapshot_camera_entity_id or "").strip() if source else ""
+    if snapshot_camera_entity_id:
+        try:
+            binary = await ha_client.fetch_camera_proxy_image(snapshot_camera_entity_id)
+            if binary:
+                logger.info(
+                    "Loaded snapshot bytes for AI from camera proxy %s on channel %d",
+                    snapshot_camera_entity_id,
+                    channel,
+                )
+                return binary, f"{snapshot_camera_entity_id.replace('.', '_')}.jpg"
+        except HomeAssistantClientError as exc:
+            logger.info(
+                "Failed to fetch camera proxy snapshot bytes for AI from %s: %s",
+                snapshot_camera_entity_id,
+                exc,
+            )
 
     return None, snapshot_path.name if snapshot_path else Path(raw).name
 
@@ -772,7 +791,7 @@ async def _maybe_enrich_notification(entry: TimelineEntry) -> tuple[Optional[str
     if not snapshot_url:
         logger.info("AI enrichment skipped for %s: no snapshot path available", entry.entry_id)
         return None, {}
-    snapshot_bytes, snapshot_name = await _load_snapshot_bytes(snapshot_url)
+    snapshot_bytes, snapshot_name = await _load_snapshot_bytes(entry.channel, snapshot_url)
     if not snapshot_bytes:
         snapshot_path = _snapshot_url_to_local_path(snapshot_url)
         logger.info(
@@ -1259,7 +1278,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title=APP_NAME,
     description="Camera event dashboard, clip playback, and live view for a Reolink NVR",
-    version="0.5.3",
+    version="0.5.4",
     lifespan=lifespan,
 )
 
@@ -1894,7 +1913,7 @@ async def root(request: Request):
         return HTMLResponse(_dashboard_html_v2())
     return {
         "name": APP_NAME,
-        "version": "0.5.3",
+        "version": "0.5.4",
         "status": "running",
         "docs": "/docs",
         "health": "/api/health",

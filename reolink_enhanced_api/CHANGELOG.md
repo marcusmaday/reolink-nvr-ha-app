@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.5.4
+
+- Fix AI snapshot enrichment again by falling back to the authenticated Home Assistant `camera_proxy` endpoint for the configured snapshot camera when static `/local/...` files are not readable from the add-on.
+- Keep the detailed AI-enrichment diagnostics so it is easier to tell whether a skip came from per-camera AI settings, snapshot access, or the upstream AI request itself.
+
 ## 0.5.3
 
 - Fix AI snapshot enrichment in the add-on by loading snapshot bytes through Home Assistant when `/local/...` images are not directly mounted inside the Watchtower container.

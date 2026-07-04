@@ -110,6 +110,16 @@ class HomeAssistantClient:
             logger.error("Home Assistant binary fetch failed: %s", exc)
             raise HomeAssistantClientError(str(exc)) from exc
 
+    async def fetch_camera_proxy_image(self, entity_id: str) -> bytes:
+        if not self.enabled:
+            raise HomeAssistantClientError("Missing SUPERVISOR_TOKEN")
+
+        cleaned = (entity_id or "").strip()
+        if not cleaned:
+            raise HomeAssistantClientError("Missing camera entity_id for proxy fetch")
+
+        return await self._request_bytes("GET", f"/camera_proxy/{cleaned}")
+
     async def _request(self, method: str, path: str, json: dict[str, Any] | None = None) -> Any:
         if not self.enabled:
             raise HomeAssistantClientError("Missing SUPERVISOR_TOKEN")
@@ -134,4 +144,25 @@ class HomeAssistantClient:
                     return await resp.text()
         except aiohttp.ClientError as exc:
             logger.error("Home Assistant API request failed: %s", exc)
+            raise HomeAssistantClientError(str(exc)) from exc
+
+    async def _request_bytes(self, method: str, path: str) -> bytes:
+        if not self.enabled:
+            raise HomeAssistantClientError("Missing SUPERVISOR_TOKEN")
+
+        headers = {"Authorization": f"Bearer {self._supervisor_token}"}
+        url = f"{self._base_url}{path}"
+        timeout = aiohttp.ClientTimeout(total=20, connect=10, sock_connect=10, sock_read=20)
+
+        try:
+            async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
+                async with session.request(method, url) as resp:
+                    if resp.status >= 400:
+                        text = await resp.text()
+                        raise HomeAssistantClientError(
+                            f"Home Assistant API {method} {path} failed with {resp.status}: {text[:400]}"
+                        )
+                    return await resp.read()
+        except aiohttp.ClientError as exc:
+            logger.error("Home Assistant API binary request failed: %s", exc)
             raise HomeAssistantClientError(str(exc)) from exc
