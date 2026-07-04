@@ -80,6 +80,13 @@ Open Watchtower and configure the Home Assistant side directly inside the app:
 - choose your Home Assistant mobile app notify services
 - set per-camera event rules and cooldowns
 - optionally enable doorbell unlock actions
+- optionally enable AI snapshot descriptions, enter your OpenAI API key, and add any known-subject context you want the model to use
+
+For known-subject context, keep the descriptions concrete and visual. Good examples:
+
+- `Fozzie`: brown dog with a lighter chest
+- `Brooklyn`: mostly white dog
+- `Mail carrier`: postal worker who often carries letters or small packages
 
 Watchtower listens to those entities over the Home Assistant websocket API and
 uses the optional snapshot camera to capture notification thumbnails with

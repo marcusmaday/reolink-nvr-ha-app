@@ -34,15 +34,19 @@ Returns the resolved Watchtower camera selection: available channels, participat
 
 ### `GET /api/home-assistant/status`
 
-Returns whether Watchtower can reach Home Assistant Core through the Supervisor proxy and which `notify.mobile_app_*` services it discovers.
+Returns whether Watchtower can reach Home Assistant Core through the Supervisor proxy, which `notify.mobile_app_*` services it discovers, and whether the direct websocket listener is running.
+
+### `GET /api/home-assistant/entities`
+
+Returns the discovered Home Assistant `binary_sensor` and `camera` entities that can be mapped to Watchtower cameras in the settings UI.
 
 ### `GET /api/notifications/config`
 
-Returns the persisted Watchtower-managed notification settings together with the discovered Home Assistant mobile app notify services.
+Returns the persisted Watchtower-managed notification settings together with the discovered Home Assistant mobile app notify services. This now includes optional AI enrichment settings and any configured known-subject descriptors.
 
 ### `PUT /api/notifications/config`
 
-Updates the persisted Watchtower-managed notification settings.
+Updates the persisted Watchtower-managed notification settings, including AI enrichment preferences, per-camera AI routing, and known-subject context.
 
 ### `POST /api/notifications/test`
 
@@ -113,7 +117,7 @@ Parameters:
 
 Creates a timeline entry from Home Assistant or another source.
 
-This is the relay endpoint used by the Home Assistant notification flow.
+This is the optional relay endpoint used by the fallback Home Assistant blueprint path.
 
 Notes:
 
@@ -173,3 +177,4 @@ Timeline entries and recent events include the clip URL, live URL, thumbnail URL
 - `PERSON` and `DOORBELL` are the main event types for the mobile notification flow.
 - `channel=0` means the first camera channel.
 - If you are testing through Home Assistant ingress, use the app route under `/app/...` instead of a raw LAN URL.
+- The recommended setup is now direct Home Assistant websocket listening configured inside Watchtower, not the relay blueprint.

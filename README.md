@@ -10,6 +10,7 @@ Watchtower is a Home Assistant add-on and companion app for a Reolink NVR. It gi
 - camera-aware filtering across any participating NVR channels
 - per-camera event-type selection so each camera can focus on only the detections you care about
 - Watchtower-managed Home Assistant notifications with app links, per-camera routing, and optional doorbell unlock actions
+- optional AI-enriched notification descriptions with user-defined known subjects like pets or recurring visitors
 - a searchable recording timeline for the NVR
 - direct Home Assistant websocket event listening with per-camera entity mapping
 - an optional lightweight Home Assistant event-forwarding blueprint fallback
@@ -59,6 +60,7 @@ The recommended setup is:
 2. Install the add-on.
 3. Set your NVR connection in the add-on options.
 4. Configure Home Assistant event sources and notifications inside Watchtower.
+   Optionally add AI enrichment and known-subject context there too.
 5. Open the app from the Home Assistant dashboard or from a notification tap.
 
 The blueprint and `rest_command` relay are still available as a fallback, but

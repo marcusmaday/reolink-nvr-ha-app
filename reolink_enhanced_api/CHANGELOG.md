@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.5.0
+
+- Add optional OpenAI-powered notification enrichment so Watchtower can turn a snapshot into a short, fun notification description before delivery.
+- Add in-app AI settings for model choice, detail level, confidence threshold, daily cap, and per-camera AI event selection.
+- Add user-defined known-subject context with plain-English descriptions and optional camera or event scoping, so Watchtower can try to recognize recurring pets or visitors like named dogs or a mail carrier.
+
+## 0.4.59
+
+- Remove the remaining persisted `app_target` notification setting and hardcode the Watchtower ingress deep-link target so the saved configuration matches the websocket-first app flow.
+- Keep notification event deep links pinned to the exact `event_id` with URL-safe encoding for a more reliable mobile clip-opening experience.
+
+## 0.4.58
+
+- Fix Watchtower-managed notification deep links so `event_id` is URL-encoded correctly and "View Event Clip" can reopen the exact event instead of falling back to the latest clip.
+- Remove the no-longer-needed app target field from the settings UI and refresh the docs/API notes around the websocket-first Home Assistant flow.
+
 ## 0.4.57
 
 - Add direct Home Assistant websocket event listening with per-camera entity mapping in the Watchtower settings UI, so Watchtower can react to Reolink-related Home Assistant sensors without relying on a blueprint relay.

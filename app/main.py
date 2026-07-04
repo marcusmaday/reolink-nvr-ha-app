@@ -9,12 +9,13 @@ import html
 import json
 import logging
 import asyncio
+import re
 import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta, timezone
 from typing import Optional, List, Any
 from contextlib import asynccontextmanager
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlencode
 
 from fastapi import FastAPI, Query, HTTPException, WebSocket, WebSocketDisconnect, Request
 from fastapi.responses import JSONResponse, HTMLResponse, FileResponse, RedirectResponse, StreamingResponse
@@ -35,13 +36,17 @@ from timeline_index import TimelineIndex, TimelineEntry
 from storage_manager import StorageManager
 from rolling_buffer import RollingSegmentBuffer
 from reolink_search import search_recordings, get_channels_info, EVENT_TYPE_MAP
+from ai_enrichment import AIEnrichmentError, NotificationEnrichmentResult, OpenAIEnrichmentClient
 from ha_client import HomeAssistantClient, HomeAssistantClientError
 from ha_ws_listener import HomeAssistantWebSocketListener
 from settings_store import (
+    AIEnrichmentSettings,
     SUPPORTED_EVENT_TYPES,
     CameraNotificationSettings,
+    CameraAISettings,
     DoorbellActionSettings,
     HomeAssistantCameraSourceSettings,
+    KnownSubjectSettings,
     ManagedNotificationSettings,
     NotificationRule,
     SettingsStore,
@@ -57,6 +62,7 @@ logger = logging.getLogger(__name__)
 APP_NAME = "Watchtower"
 APP_TAGLINE = "Recent camera events with player-first playback"
 LIVE_PAGE_TITLE = "Watchtower"
+APP_NAVIGATION_TARGET = "/app/15e0e6e5_watchtower"
 
 APP_CONFIG: AppConfig = get_config()
 if APP_CONFIG.api.debug:
@@ -143,6 +149,7 @@ notification_delivery_history: dict[tuple[int, str], datetime] = {}
 ha_ws_listener_task: Optional[asyncio.Task] = None
 ha_ws_listener: Optional[HomeAssistantWebSocketListener] = None
 ha_state_event_history: dict[str, datetime] = {}
+ai_enrichment_history: dict[str, int] = {}
 
 
 # ─── Pydantic models ──────────────────────────────────────────────────────────
@@ -442,6 +449,121 @@ def _camera_ha_source_settings(channel: int) -> Optional[HomeAssistantCameraSour
     return camera_settings.ha_source
 
 
+def _camera_ai_settings(channel: int) -> Optional[CameraAISettings]:
+    camera_settings = _notification_camera_settings(channel)
+    if not camera_settings:
+        return None
+    return camera_settings.ai
+
+
+def _ai_settings() -> AIEnrichmentSettings:
+    return watchtower_settings.notifications.ai
+
+
+def _ai_api_key() -> str:
+    settings_key = (_ai_settings().api_key or "").strip()
+    env_key = os.getenv("OPENAI_API_KEY", "").strip()
+    return settings_key or env_key
+
+
+def _event_supports_ai(event_type: str) -> bool:
+    return event_type in {"DOORBELL", "PERSON", "ANIMAL", "VEHICLE"}
+
+
+def _normalize_subject_name(value: Optional[str]) -> str:
+    cleaned = re.sub(r"\s+", " ", (value or "").strip())
+    return cleaned.casefold()
+
+
+def _filtered_known_subjects(channel: int, event_type: str) -> list[KnownSubjectSettings]:
+    subjects: list[KnownSubjectSettings] = []
+    seen_names: set[str] = set()
+    for subject in watchtower_settings.notifications.known_subjects:
+        if not subject.enabled:
+            continue
+        name = (subject.name or "").strip()
+        description = (subject.description or "").strip()
+        if not name or not description:
+            continue
+        if subject.channels and channel not in subject.channels:
+            continue
+        if subject.event_types and event_type not in subject.event_types:
+            continue
+        normalized_name = _normalize_subject_name(name)
+        if normalized_name in seen_names:
+            continue
+        seen_names.add(normalized_name)
+        subjects.append(subject)
+    return subjects
+
+
+def _ai_event_count_key(now: datetime) -> str:
+    return now.astimezone(timezone.utc).strftime("%Y-%m-%d")
+
+
+def _ai_daily_cap_remaining() -> bool:
+    settings = _ai_settings()
+    cap = max(int(settings.daily_event_cap), 0)
+    if cap <= 0:
+        return True
+    key = _ai_event_count_key(datetime.now(timezone.utc))
+    return ai_enrichment_history.get(key, 0) < cap
+
+
+def _record_ai_enrichment_attempt() -> None:
+    key = _ai_event_count_key(datetime.now(timezone.utc))
+    ai_enrichment_history[key] = ai_enrichment_history.get(key, 0) + 1
+
+
+def _snapshot_url_to_local_path(snapshot_url: Optional[str]) -> Optional[Path]:
+    raw = (snapshot_url or "").strip()
+    if not raw:
+        return None
+    if raw.startswith("/config/"):
+        return Path(raw)
+    if raw.startswith("/local/"):
+        return Path("/config/www") / raw[len("/local/"):]
+    if raw.startswith("file://"):
+        parsed = urlparse(raw)
+        return Path(parsed.path)
+    return None
+
+
+def _compose_enriched_notification_message(
+    *,
+    enrichment: NotificationEnrichmentResult,
+    confidence_threshold: float,
+    include_fun_summary: bool,
+) -> tuple[Optional[str], dict[str, str]]:
+    known_subject_name = (enrichment.known_subject_name or "").strip()
+    safe_summary = (enrichment.safe_summary or "").strip()
+    fun_summary = (enrichment.fun_summary or "").strip()
+    chosen_summary = fun_summary if include_fun_summary and fun_summary else safe_summary
+    known_subject_confidence = float(enrichment.known_subject_confidence or 0.0)
+    identity_confident = (
+        known_subject_name
+        and known_subject_name.casefold() != "unknown"
+        and known_subject_confidence >= confidence_threshold
+    )
+
+    if identity_confident and known_subject_name and chosen_summary:
+        if known_subject_name.casefold() not in chosen_summary.casefold():
+            if safe_summary and include_fun_summary and fun_summary:
+                chosen_summary = f"{known_subject_name} may be in view. {fun_summary}"
+            else:
+                chosen_summary = f"{known_subject_name} may be in view. {chosen_summary}"
+    elif not chosen_summary:
+        return None, {}
+
+    return chosen_summary, {
+        "ai_summary": safe_summary,
+        "ai_fun_summary": fun_summary,
+        "known_subject_name": known_subject_name if identity_confident else "",
+        "primary_subject": (enrichment.primary_subject or "").strip(),
+        "activity": (enrichment.activity or "").strip(),
+    }
+
+
 def _entity_mapping_for_state_change(entity_id: str) -> Optional[tuple[int, str]]:
     normalized = (entity_id or "").strip().lower()
     if not normalized:
@@ -490,11 +612,18 @@ async def _capture_snapshot_for_channel(channel: int, event_type: str, event_tim
     return snapshot_url
 
 
-def _render_notification_text(template: Optional[str], fallback: str, *, entry: TimelineEntry) -> str:
+def _render_notification_text(
+    template: Optional[str],
+    fallback: str,
+    *,
+    entry: TimelineEntry,
+    extra_context: Optional[dict[str, str]] = None,
+) -> str:
     if not template:
         return fallback
 
     metadata = entry.metadata or {}
+    context = extra_context or {}
     try:
         return template.format(
             camera_name=metadata.get("camera_name") or _channel_name(entry.channel) or f"Channel {entry.channel}",
@@ -503,6 +632,11 @@ def _render_notification_text(template: Optional[str], fallback: str, *, entry: 
             timestamp=entry.timestamp.isoformat(),
             title=metadata.get("title") or fallback,
             message=metadata.get("message") or fallback,
+            ai_summary=context.get("ai_summary", ""),
+            ai_fun_summary=context.get("ai_fun_summary", ""),
+            known_subject_name=context.get("known_subject_name", ""),
+            primary_subject=context.get("primary_subject", ""),
+            activity=context.get("activity", ""),
         )
     except Exception as exc:
         logger.warning("Failed to render notification template '%s': %s", template, exc)
@@ -510,9 +644,18 @@ def _render_notification_text(template: Optional[str], fallback: str, *, entry: 
 
 
 def _build_managed_app_event_url(entry: TimelineEntry) -> str:
-    base = (watchtower_settings.notifications.app_target or "/app/15e0e6e5_watchtower").strip() or "/app/15e0e6e5_watchtower"
+    raw_base = APP_NAVIGATION_TARGET
+    if raw_base.startswith("homeassistant://"):
+        base = raw_base
+    elif "://" in raw_base:
+        host_and_path = raw_base.split("://", 1)[1]
+        base = f"homeassistant://navigate/{host_and_path.split('/', 1)[1]}" if "/" in host_and_path else "homeassistant://navigate/"
+    elif raw_base.startswith("/"):
+        base = f"homeassistant://navigate{raw_base}"
+    else:
+        base = f"homeassistant://navigate/{raw_base}"
     separator = "&" if "?" in base else "?"
-    return f"{base}{separator}event_id={entry.entry_id}"
+    return f"{base}{separator}{urlencode({'event_id': entry.entry_id})}"
 
 
 def _camera_doorbell_action(channel: int) -> Optional[DoorbellActionSettings]:
@@ -527,10 +670,10 @@ def _camera_doorbell_action(channel: int) -> Optional[DoorbellActionSettings]:
 
 def _build_managed_unlock_url(channel: int, entry_id: Optional[str] = None) -> str:
     base = "/app/doorbell-action"
-    query = f"?channel={channel}"
+    query = {"channel": channel}
     if entry_id:
-        query += f"&event_id={entry_id}"
-    return f"{base}{query}"
+        query["event_id"] = entry_id
+    return f"{base}?{urlencode(query)}"
 
 
 async def _execute_doorbell_action(channel: int, event_id: Optional[str] = None) -> dict[str, Any]:
@@ -566,6 +709,60 @@ async def _execute_doorbell_action(channel: int, event_id: Optional[str] = None)
     }
 
 
+async def _maybe_enrich_notification(entry: TimelineEntry) -> tuple[Optional[str], dict[str, str]]:
+    settings = _ai_settings()
+    if not settings.enabled:
+        return None, {}
+    if settings.provider.strip().lower() != "openai":
+        return None, {}
+    if not _event_supports_ai(entry.event_type):
+        return None, {}
+    if not _ai_daily_cap_remaining():
+        return None, {}
+
+    camera_ai = _camera_ai_settings(entry.channel)
+    if not camera_ai or not camera_ai.enabled or entry.event_type not in (camera_ai.event_types or []):
+        return None, {}
+
+    api_key = _ai_api_key()
+    if not api_key:
+        return None, {}
+
+    metadata = entry.metadata or {}
+    snapshot_path = _snapshot_url_to_local_path(metadata.get("snapshot_url") or entry.thumbnail_path)
+    if not snapshot_path or not snapshot_path.exists():
+        return None, {}
+
+    known_subjects = _filtered_known_subjects(entry.channel, entry.event_type)
+    camera_name = metadata.get("camera_name") or _channel_name(entry.channel) or f"Channel {entry.channel}"
+
+    try:
+        _record_ai_enrichment_attempt()
+        enrichment = await OpenAIEnrichmentClient(
+            api_key=api_key,
+            timeout_seconds=settings.timeout_seconds,
+        ).analyze_snapshot(
+            image_path=snapshot_path,
+            event_type=entry.event_type,
+            camera_name=camera_name,
+            settings=settings,
+            known_subjects=known_subjects,
+        )
+    except AIEnrichmentError as exc:
+        logger.warning("AI enrichment skipped for %s: %s", entry.entry_id, exc)
+        return None, {}
+    except Exception as exc:
+        logger.warning("Unexpected AI enrichment error for %s: %s", entry.entry_id, exc)
+        return None, {}
+
+    message, context = _compose_enriched_notification_message(
+        enrichment=enrichment,
+        confidence_threshold=max(min(float(settings.confidence_threshold), 1.0), 0.0),
+        include_fun_summary=settings.include_fun_summary and settings.fun_style != "off",
+    )
+    return message, context
+
+
 async def _send_managed_notifications(entry: TimelineEntry) -> None:
     if not ha_client.enabled or not watchtower_settings.notifications.enabled:
         return
@@ -596,8 +793,19 @@ async def _send_managed_notifications(entry: TimelineEntry) -> None:
         return
 
     metadata = entry.metadata or {}
-    title = _render_notification_text(rule.title_template, metadata.get("title") or f"{entry.event_type.title()} detected", entry=entry)
-    message = _render_notification_text(rule.message_template, metadata.get("message") or f"{entry.event_type.title()} detected", entry=entry)
+    enriched_message, enrichment_context = await _maybe_enrich_notification(entry)
+    title = _render_notification_text(
+        rule.title_template,
+        metadata.get("title") or f"{entry.event_type.title()} detected",
+        entry=entry,
+        extra_context=enrichment_context,
+    )
+    message = _render_notification_text(
+        rule.message_template,
+        enriched_message or metadata.get("message") or f"{entry.event_type.title()} detected",
+        entry=entry,
+        extra_context=enrichment_context,
+    )
     snapshot_url = metadata.get("snapshot_url") or entry.thumbnail_path
     app_event_url = _build_managed_app_event_url(entry)
     payload = {
@@ -989,7 +1197,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title=APP_NAME,
     description="Camera event dashboard, clip playback, and live view for a Reolink NVR",
-    version="0.4.57",
+    version="0.5.0",
     lifespan=lifespan,
 )
 
@@ -1624,7 +1832,7 @@ async def root(request: Request):
         return HTMLResponse(_dashboard_html_v2())
     return {
         "name": APP_NAME,
-        "version": "0.4.57",
+        "version": "0.5.0",
         "status": "running",
         "docs": "/docs",
         "health": "/api/health",
@@ -3326,7 +3534,6 @@ def _dashboard_html_v2() -> str:
       ANIMAL: 'Animal',
       VEHICLE: 'Vehicle',
     };
-    const defaultNotificationPath = '/app/15e0e6e5_watchtower';
     const state = {
       events: [],
       channels: [],
@@ -3437,10 +3644,33 @@ def _dashboard_html_v2() -> str:
     function emptyNotificationSettings() {
       return {
         enabled: false,
-        app_target: defaultNotificationPath,
         default_notify_services: [],
         preferred_test_service: '',
+        ai: {
+          enabled: false,
+          provider: 'openai',
+          api_key: '',
+          model: 'gpt-4.1-mini',
+          detail: 'low',
+          timeout_seconds: 8,
+          confidence_threshold: 0.78,
+          daily_event_cap: 100,
+          include_fun_summary: true,
+          fun_style: 'playful',
+        },
+        known_subjects: [],
         cameras: [],
+      };
+    }
+
+    function emptyKnownSubject() {
+      return {
+        enabled: true,
+        name: '',
+        subject_type: 'other',
+        description: '',
+        channels: [],
+        event_types: [],
       };
     }
 
@@ -3480,14 +3710,45 @@ def _dashboard_html_v2() -> str:
             vehicle_entity_id: typeof existing.ha_source?.vehicle_entity_id === 'string' ? existing.ha_source.vehicle_entity_id.trim() : '',
             snapshot_camera_entity_id: typeof existing.ha_source?.snapshot_camera_entity_id === 'string' ? existing.ha_source.snapshot_camera_entity_id.trim() : '',
           },
+          ai: {
+            enabled: !!existing.ai?.enabled,
+            event_types: Array.isArray(existing.ai?.event_types)
+              ? existing.ai.event_types.filter(eventType => allowedEventTypes.includes(eventType))
+              : allowedEventTypes.filter(eventType => ['DOORBELL', 'PERSON', 'ANIMAL', 'VEHICLE'].includes(eventType)),
+          },
           rules,
         };
       });
       state.notifications = {
         enabled: !!base.enabled,
-        app_target: typeof base.app_target === 'string' && base.app_target.trim() ? base.app_target.trim() : defaultNotificationPath,
         default_notify_services: Array.isArray(base.default_notify_services) ? [...base.default_notify_services] : [],
         preferred_test_service: typeof base.preferred_test_service === 'string' ? base.preferred_test_service.trim() : '',
+        ai: {
+          enabled: !!base.ai?.enabled,
+          provider: typeof base.ai?.provider === 'string' && base.ai.provider.trim() ? base.ai.provider.trim() : 'openai',
+          api_key: typeof base.ai?.api_key === 'string' ? base.ai.api_key : '',
+          model: typeof base.ai?.model === 'string' && base.ai.model.trim() ? base.ai.model.trim() : 'gpt-4.1-mini',
+          detail: base.ai?.detail === 'high' ? 'high' : 'low',
+          timeout_seconds: Number.isFinite(Number(base.ai?.timeout_seconds)) ? Math.max(Number(base.ai.timeout_seconds), 3) : 8,
+          confidence_threshold: Number.isFinite(Number(base.ai?.confidence_threshold)) ? Math.min(Math.max(Number(base.ai.confidence_threshold), 0), 1) : 0.78,
+          daily_event_cap: Number.isFinite(Number(base.ai?.daily_event_cap)) ? Math.max(Number(base.ai.daily_event_cap), 0) : 100,
+          include_fun_summary: base.ai?.include_fun_summary !== false,
+          fun_style: typeof base.ai?.fun_style === 'string' && ['off', 'mild', 'playful'].includes(base.ai.fun_style) ? base.ai.fun_style : 'playful',
+        },
+        known_subjects: Array.isArray(base.known_subjects)
+          ? base.known_subjects.map(subject => ({
+              enabled: subject?.enabled !== false,
+              name: typeof subject?.name === 'string' ? subject.name.trim() : '',
+              subject_type: typeof subject?.subject_type === 'string' && subject.subject_type.trim() ? subject.subject_type.trim() : 'other',
+              description: typeof subject?.description === 'string' ? subject.description.trim() : '',
+              channels: Array.isArray(subject?.channels)
+                ? subject.channels.map(value => Number.parseInt(value, 10)).filter(value => Number.isFinite(value))
+                : [],
+              event_types: Array.isArray(subject?.event_types)
+                ? subject.event_types.filter(eventType => state.supportedEventTypes.includes(eventType))
+                : [],
+            }))
+          : [],
         cameras: syncedCameras,
       };
     }
@@ -3577,10 +3838,80 @@ def _dashboard_html_v2() -> str:
       }
 
       const settings = state.notifications;
+      const aiSettings = settings.ai || emptyNotificationSettings().ai;
       const discoveredServices = availableNotifyServices();
       const binarySensorOptions = entityOptions(state.haEntities.binary_sensors);
       const cameraOptions = entityOptions(state.haEntities.cameras);
       const testServiceOptions = discoveredServices.map(service => `<option value="${escapeHtml(service)}">${escapeHtml(service)}</option>`).join('');
+      const knownSubjectCards = (settings.known_subjects || []).map((subject, index) => {
+        const scopedAllChannels = !subject.channels || !subject.channels.length;
+        const scopedAllEvents = !subject.event_types || !subject.event_types.length;
+        return `
+          <div class="event-rule">
+            <div class="rule-row">
+              <label class="inline-check">
+                <input type="checkbox" data-known-subject-enabled="${index}" ${subject.enabled ? 'checked' : ''}>
+                <span><strong>Known subject ${index + 1}</strong></span>
+              </label>
+              <button type="button" class="ghost" data-remove-known-subject="${index}">Remove</button>
+            </div>
+            <div class="field">
+              <label>Name</label>
+              <input type="text" data-known-subject-name="${index}" value="${escapeHtml(subject.name || '')}" placeholder="Fozzie">
+            </div>
+            <div class="field">
+              <label>Type</label>
+              <select data-known-subject-type="${index}">
+                ${['dog', 'person', 'role', 'vehicle', 'other'].map(type => `
+                  <option value="${type}" ${subject.subject_type === type ? 'selected' : ''}>${escapeHtml(type)}</option>
+                `).join('')}
+              </select>
+            </div>
+            <div class="field">
+              <label>Description</label>
+              <textarea data-known-subject-description="${index}" placeholder="Brown dog with a lighter chest who usually hangs out by the backyard fence.">${escapeHtml(subject.description || '')}</textarea>
+            </div>
+            <div class="field">
+              <label>Applies to cameras</label>
+              <div class="service-grid">
+                <label class="service-option">
+                  <span class="inline-check">
+                    <input type="checkbox" data-known-subject-all-channels="${index}" ${scopedAllChannels ? 'checked' : ''}>
+                    <span>All cameras</span>
+                  </span>
+                </label>
+                ${state.channels.map(channelInfo => `
+                  <label class="service-option">
+                    <span class="inline-check">
+                      <input type="checkbox" data-known-subject-channel="${index}" value="${channelInfo.channel}" ${subject.channels?.includes(channelInfo.channel) ? 'checked' : ''}>
+                      <span>${escapeHtml(channelInfo.name || `Channel ${channelInfo.channel}`)}</span>
+                    </span>
+                  </label>
+                `).join('')}
+              </div>
+            </div>
+            <div class="field">
+              <label>Applies to event types</label>
+              <div class="service-grid">
+                <label class="service-option">
+                  <span class="inline-check">
+                    <input type="checkbox" data-known-subject-all-events="${index}" ${scopedAllEvents ? 'checked' : ''}>
+                    <span>All supported events</span>
+                  </span>
+                </label>
+                ${state.supportedEventTypes.filter(eventType => ['DOORBELL', 'PERSON', 'ANIMAL', 'VEHICLE'].includes(eventType)).map(eventType => `
+                  <label class="service-option">
+                    <span class="inline-check">
+                      <input type="checkbox" data-known-subject-event="${index}" value="${eventType}" ${subject.event_types?.includes(eventType) ? 'checked' : ''}>
+                      <span>${escapeHtml(eventTypeLabels[eventType] || eventType)}</span>
+                    </span>
+                  </label>
+                `).join('')}
+              </div>
+            </div>
+          </div>
+        `;
+      }).join('');
 
       settingsBody.innerHTML = `
         <datalist id="haBinarySensorOptions">${binarySensorOptions}</datalist>
@@ -3611,12 +3942,6 @@ def _dashboard_html_v2() -> str:
           </div>
 
           <div class="field">
-            <label for="appTarget">App target</label>
-            <input id="appTarget" type="text" value="${escapeHtml(settings.app_target || defaultNotificationPath)}" placeholder="${escapeHtml(defaultNotificationPath)}">
-            <div class="settings-note">Default is the Home Assistant ingress path for this add-on. Watchtower appends the event id automatically.</div>
-          </div>
-
-          <div class="field">
             <label>Default notify services</label>
             ${serviceCheckboxList(settings.default_notify_services || [], 'data-default-service')}
             <div class="settings-note">These services are used by any camera still set to inherit the default service list.</div>
@@ -3628,6 +3953,70 @@ def _dashboard_html_v2() -> str:
               ${testServiceOptions || '<option value="">No services available</option>'}
             </select>
           </div>
+        </div>
+
+        <div class="settings-card">
+          <div class="toggle">
+            <div>
+              <strong>Enable AI snapshot descriptions</strong>
+              <div class="settings-note">When enabled, Watchtower can send selected snapshots to OpenAI to add a short, fun description before the notification is delivered.</div>
+            </div>
+            <input type="checkbox" id="aiEnabled" ${aiSettings.enabled ? 'checked' : ''}>
+          </div>
+          <div class="field">
+            <label>Provider</label>
+            <input type="text" value="OpenAI" disabled>
+          </div>
+          <div class="field">
+            <label for="aiApiKey">OpenAI API key</label>
+            <input type="password" id="aiApiKey" value="${escapeHtml(aiSettings.api_key || '')}" placeholder="sk-...">
+            <div class="settings-note">Stored in Watchtower settings on this Home Assistant system. Leave it blank if you prefer to supply OPENAI_API_KEY through the runtime environment.</div>
+          </div>
+          <div class="field">
+            <label for="aiModel">Model</label>
+            <input type="text" id="aiModel" value="${escapeHtml(aiSettings.model || 'gpt-4.1-mini')}" placeholder="gpt-4.1-mini">
+          </div>
+          <div class="field">
+            <label for="aiDetail">Image detail</label>
+            <select id="aiDetail">
+              <option value="low" ${aiSettings.detail !== 'high' ? 'selected' : ''}>Low cost</option>
+              <option value="high" ${aiSettings.detail === 'high' ? 'selected' : ''}>Higher detail</option>
+            </select>
+          </div>
+          <div class="field">
+            <label for="aiTimeout">Timeout (seconds)</label>
+            <input type="number" id="aiTimeout" min="3" step="1" value="${escapeHtml(aiSettings.timeout_seconds)}">
+          </div>
+          <div class="field">
+            <label for="aiConfidence">Identity confidence threshold</label>
+            <input type="number" id="aiConfidence" min="0" max="1" step="0.01" value="${escapeHtml(aiSettings.confidence_threshold)}">
+          </div>
+          <div class="field">
+            <label for="aiDailyCap">Daily AI event cap</label>
+            <input type="number" id="aiDailyCap" min="0" step="1" value="${escapeHtml(aiSettings.daily_event_cap)}">
+            <div class="settings-note">Set to 0 for no in-memory cap. This helps keep API usage predictable.</div>
+          </div>
+          <div class="field">
+            <label for="aiFunStyle">Fun style</label>
+            <select id="aiFunStyle">
+              <option value="off" ${aiSettings.fun_style === 'off' ? 'selected' : ''}>Off</option>
+              <option value="mild" ${aiSettings.fun_style === 'mild' ? 'selected' : ''}>Mild</option>
+              <option value="playful" ${aiSettings.fun_style === 'playful' ? 'selected' : ''}>Playful</option>
+            </select>
+          </div>
+          <label class="inline-check">
+            <input type="checkbox" id="aiIncludeFunSummary" ${aiSettings.include_fun_summary ? 'checked' : ''}>
+            <span>Allow playful notification copy when the model is confident</span>
+          </label>
+        </div>
+
+        <div class="settings-card">
+          <div class="row">
+            <h3>Known subjects</h3>
+            <button type="button" class="ghost" data-add-known-subject>Add Subject</button>
+          </div>
+          <p>Use this to teach Watchtower about recurring people, pets, or roles in plain English. A short description like "brown dog" or "mail carrier with mail bag" is usually enough for a lightweight first pass.</p>
+          ${knownSubjectCards || '<div class="settings-note">No known subjects yet. Add one if you want Watchtower to try naming your dogs or spotting recurring visitors.</div>'}
         </div>
 
         <div class="settings-card">
@@ -3705,6 +4094,29 @@ def _dashboard_html_v2() -> str:
                     <input type="text" list="haCameraOptions" data-ha-snapshot-camera="${camera.channel}" value="${escapeHtml(camera.ha_source?.snapshot_camera_entity_id || '')}" placeholder="camera.front_door_fluent">
                   </div>
                   <div class="settings-note">Watchtower listens directly to these Home Assistant entities over the websocket API. Leave any field blank if that event type does not apply to this camera.</div>
+                </div>
+
+                <div class="event-rule">
+                  <div class="rule-row">
+                    <label class="inline-check">
+                      <input type="checkbox" data-camera-ai-enabled="${camera.channel}" ${camera.ai?.enabled ? 'checked' : ''}>
+                      <span><strong>Use AI descriptions on this camera</strong></span>
+                    </label>
+                  </div>
+                  <div class="field">
+                    <label>AI event types</label>
+                    <div class="service-grid">
+                      ${channelAllowedEventTypes(camera.channel).filter(eventType => ['DOORBELL', 'PERSON', 'ANIMAL', 'VEHICLE'].includes(eventType)).map(eventType => `
+                        <label class="service-option">
+                          <span class="inline-check">
+                            <input type="checkbox" data-camera-ai-event="${camera.channel}" value="${eventType}" ${camera.ai?.event_types?.includes(eventType) ? 'checked' : ''}>
+                            <span>${escapeHtml(eventTypeLabels[eventType] || eventType)}</span>
+                          </span>
+                        </label>
+                      `).join('')}
+                    </div>
+                    <div class="settings-note">AI is never used for this camera unless both this toggle and one of these event types are enabled.</div>
+                  </div>
                 </div>
 
                 <div class="event-rule-grid">${cameraRules || '<div class="settings-note">No event types are enabled for this camera.</div>'}</div>
@@ -3897,13 +4309,51 @@ def _dashboard_html_v2() -> str:
     function collectNotificationSettings() {
       const next = {
         enabled: !!document.getElementById('notificationsEnabled')?.checked,
-        app_target: (document.getElementById('appTarget')?.value || defaultNotificationPath).trim() || defaultNotificationPath,
         default_notify_services: Array.from(document.querySelectorAll('[data-default-service]'))
           .filter(input => input.checked)
           .map(input => input.value),
         preferred_test_service: (document.getElementById('testService')?.value || '').trim(),
+        ai: {
+          enabled: !!document.getElementById('aiEnabled')?.checked,
+          provider: 'openai',
+          api_key: (document.getElementById('aiApiKey')?.value || '').trim(),
+          model: (document.getElementById('aiModel')?.value || 'gpt-4.1-mini').trim() || 'gpt-4.1-mini',
+          detail: (document.getElementById('aiDetail')?.value || 'low') === 'high' ? 'high' : 'low',
+          timeout_seconds: Math.max(Number.parseInt(document.getElementById('aiTimeout')?.value || '8', 10) || 8, 3),
+          confidence_threshold: Math.min(Math.max(Number.parseFloat(document.getElementById('aiConfidence')?.value || '0.78') || 0.78, 0), 1),
+          daily_event_cap: Math.max(Number.parseInt(document.getElementById('aiDailyCap')?.value || '100', 10) || 0, 0),
+          include_fun_summary: !!document.getElementById('aiIncludeFunSummary')?.checked,
+          fun_style: ['off', 'mild', 'playful'].includes(document.getElementById('aiFunStyle')?.value || '')
+            ? document.getElementById('aiFunStyle').value
+            : 'playful',
+        },
+        known_subjects: [],
         cameras: [],
       };
+
+      const knownSubjectCount = state.notifications?.known_subjects?.length || 0;
+      for (let index = 0; index < knownSubjectCount; index += 1) {
+        const allChannels = !!document.querySelector(`[data-known-subject-all-channels="${index}"]`)?.checked;
+        const allEvents = !!document.querySelector(`[data-known-subject-all-events="${index}"]`)?.checked;
+        next.known_subjects.push({
+          enabled: !!document.querySelector(`[data-known-subject-enabled="${index}"]`)?.checked,
+          name: (document.querySelector(`[data-known-subject-name="${index}"]`)?.value || '').trim(),
+          subject_type: (document.querySelector(`[data-known-subject-type="${index}"]`)?.value || 'other').trim() || 'other',
+          description: (document.querySelector(`[data-known-subject-description="${index}"]`)?.value || '').trim(),
+          channels: allChannels
+            ? []
+            : Array.from(document.querySelectorAll(`[data-known-subject-channel="${index}"]`))
+                .filter(input => input.checked)
+                .map(input => Number.parseInt(input.value, 10))
+                .filter(value => Number.isFinite(value)),
+          event_types: allEvents
+            ? []
+            : Array.from(document.querySelectorAll(`[data-known-subject-event="${index}"]`))
+                .filter(input => input.checked)
+                .map(input => input.value)
+                .filter(eventType => state.supportedEventTypes.includes(eventType)),
+        });
+      }
 
       for (const channelInfo of state.channels) {
         const channel = channelInfo.channel;
@@ -3940,6 +4390,13 @@ def _dashboard_html_v2() -> str:
             animal_entity_id: (document.querySelector(`[data-ha-animal="${channel}"]`)?.value || '').trim(),
             vehicle_entity_id: (document.querySelector(`[data-ha-vehicle="${channel}"]`)?.value || '').trim(),
             snapshot_camera_entity_id: (document.querySelector(`[data-ha-snapshot-camera="${channel}"]`)?.value || '').trim(),
+          },
+          ai: {
+            enabled: !!document.querySelector(`[data-camera-ai-enabled="${channel}"]`)?.checked,
+            event_types: Array.from(document.querySelectorAll(`[data-camera-ai-event="${channel}"]`))
+              .filter(input => input.checked)
+              .map(input => input.value)
+              .filter(eventType => channelAllowedEventTypes(channel).includes(eventType)),
           },
           rules,
         });
@@ -4004,6 +4461,24 @@ def _dashboard_html_v2() -> str:
       }
     }
 
+    function addKnownSubject() {
+      if (!state.notifications) return;
+      state.notifications = collectNotificationSettings();
+      state.notifications.known_subjects = [...(state.notifications.known_subjects || []), emptyKnownSubject()];
+      syncNotificationSettings();
+      renderNotificationSettings();
+      setSettingsStatus('Added a known subject. Describe how this subject looks so Watchtower can use that context.');
+    }
+
+    function removeKnownSubject(index) {
+      if (!state.notifications) return;
+      state.notifications = collectNotificationSettings();
+      state.notifications.known_subjects = (state.notifications.known_subjects || []).filter((_, itemIndex) => itemIndex !== index);
+      syncNotificationSettings();
+      renderNotificationSettings();
+      setSettingsStatus('Removed known subject.');
+    }
+
     function openSettings() {
       settingsShell.hidden = false;
       document.body.style.overflow = 'hidden';
@@ -4059,6 +4534,18 @@ def _dashboard_html_v2() -> str:
       const value = btn.dataset.channelFilter;
       state.channel = value === 'ALL' ? 'ALL' : Number.parseInt(value, 10);
       render();
+    });
+
+    settingsBody?.addEventListener('click', (ev) => {
+      const addButton = ev.target.closest('[data-add-known-subject]');
+      if (addButton) {
+        addKnownSubject();
+        return;
+      }
+      const removeButton = ev.target.closest('[data-remove-known-subject]');
+      if (removeButton) {
+        removeKnownSubject(Number.parseInt(removeButton.dataset.removeKnownSubject, 10));
+      }
     });
 
     settingsBody.addEventListener('change', (ev) => {
@@ -4301,6 +4788,8 @@ async def debug_info():
             "websocket_listener_running": bool(ha_ws_listener_task and not ha_ws_listener_task.done()),
             "managed_notifications_enabled": watchtower_settings.notifications.enabled,
             "default_notify_services": watchtower_settings.notifications.default_notify_services,
+            "ai_enrichment_enabled": watchtower_settings.notifications.ai.enabled,
+            "known_subject_count": len(watchtower_settings.notifications.known_subjects),
         },
         "rolling_buffers": {str(channel): buffer.get_stats() for channel, buffer in rolling_buffers.items()},
         "supported_event_types": _supported_event_types(),

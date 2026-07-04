@@ -17,6 +17,7 @@ logger = logging.getLogger(__name__)
 
 
 SUPPORTED_EVENT_TYPES = ["DOORBELL", "PERSON", "MOTION", "ANIMAL", "VEHICLE"]
+DEFAULT_AI_EVENT_TYPES = ["DOORBELL", "PERSON", "ANIMAL", "VEHICLE"]
 
 
 class NotificationRule(BaseModel):
@@ -41,6 +42,33 @@ class HomeAssistantCameraSourceSettings(BaseModel):
     snapshot_camera_entity_id: str | None = None
 
 
+class CameraAISettings(BaseModel):
+    enabled: bool = False
+    event_types: list[str] = Field(default_factory=lambda: list(DEFAULT_AI_EVENT_TYPES))
+
+
+class KnownSubjectSettings(BaseModel):
+    enabled: bool = True
+    name: str = ""
+    subject_type: str = "other"
+    description: str = ""
+    channels: list[int] = Field(default_factory=list)
+    event_types: list[str] = Field(default_factory=list)
+
+
+class AIEnrichmentSettings(BaseModel):
+    enabled: bool = False
+    provider: str = "openai"
+    api_key: str | None = None
+    model: str = "gpt-4.1-mini"
+    detail: str = "low"
+    timeout_seconds: int = 8
+    confidence_threshold: float = 0.78
+    daily_event_cap: int = 100
+    include_fun_summary: bool = True
+    fun_style: str = "playful"
+
+
 class CameraNotificationSettings(BaseModel):
     channel: int
     camera_name: str | None = None
@@ -49,13 +77,15 @@ class CameraNotificationSettings(BaseModel):
     rules: dict[str, NotificationRule] = Field(default_factory=dict)
     doorbell_action: DoorbellActionSettings = Field(default_factory=DoorbellActionSettings)
     ha_source: HomeAssistantCameraSourceSettings = Field(default_factory=HomeAssistantCameraSourceSettings)
+    ai: CameraAISettings = Field(default_factory=CameraAISettings)
 
 
 class ManagedNotificationSettings(BaseModel):
     enabled: bool = False
-    app_target: str = "/app/15e0e6e5_watchtower"
     default_notify_services: list[str] = Field(default_factory=list)
     preferred_test_service: str | None = None
+    ai: AIEnrichmentSettings = Field(default_factory=AIEnrichmentSettings)
+    known_subjects: list[KnownSubjectSettings] = Field(default_factory=list)
     cameras: list[CameraNotificationSettings] = Field(default_factory=list)
 
 
@@ -139,8 +169,31 @@ class SettingsStore:
                         if existing and existing.ha_source
                         else HomeAssistantCameraSourceSettings()
                     ),
+                    ai=(
+                        self._sync_camera_ai_settings(existing.ai, allowed_event_types)
+                        if existing and existing.ai
+                        else self._sync_camera_ai_settings(None, allowed_event_types)
+                    ),
                 )
             )
 
         settings.notifications.cameras = synced
         return settings
+
+    @staticmethod
+    def _sync_camera_ai_settings(
+        existing: CameraAISettings | None,
+        allowed_event_types: set[str],
+    ) -> CameraAISettings:
+        supported = [event_type for event_type in DEFAULT_AI_EVENT_TYPES if event_type in allowed_event_types]
+        selected = [
+            event_type
+            for event_type in ((existing.event_types if existing else []) or supported)
+            if event_type in supported
+        ]
+        if not selected and supported:
+            selected = list(supported)
+        return CameraAISettings(
+            enabled=existing.enabled if existing else False,
+            event_types=selected,
+        )

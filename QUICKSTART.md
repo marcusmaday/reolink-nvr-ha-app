@@ -64,6 +64,7 @@ Open Watchtower and use `Notification Settings` inside the app to configure:
 - the phones that should receive notifications
 - per-camera event filters and cooldowns
 - doorbell unlock actions
+- optional AI enrichment settings and any known-subject descriptions you want Watchtower to use, such as `Fozzie: brown dog` or `Brooklyn: white dog`
 
 Note:
 
@@ -78,6 +79,7 @@ What you should see:
 - an event clip in the app timeline
 - a Watchtower-managed notification
 - a snapshot thumbnail if you configured a snapshot camera
+- optionally, an AI-enriched description if you enabled it for that camera and event type
 - unlock for doorbell notifications if you enabled it in Watchtower
 
 ## 5. If Something Is Off
