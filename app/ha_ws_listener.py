@@ -9,7 +9,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-from typing import Awaitable, Callable
+from typing import Any, Awaitable, Callable
 
 import aiohttp
 
@@ -82,19 +82,36 @@ class HomeAssistantWebSocketListener:
                             raise RuntimeError(f"HA websocket closed: {msg.type}")
                         continue
 
-                    payload = json.loads(msg.data)
-                    if payload.get("type") != "event" or payload.get("id") != 2:
-                        continue
-                    event = payload.get("event") or {}
-                    if event.get("event_type") != "state_changed":
-                        continue
-                    await self._on_state_changed(event)
+                    raw_payload = json.loads(msg.data)
+                    for payload in self._iter_messages(raw_payload):
+                        if payload.get("type") != "event" or payload.get("id") != 2:
+                            continue
+                        event = payload.get("event") or {}
+                        if event.get("event_type") != "state_changed":
+                            continue
+                        await self._on_state_changed(event)
 
     async def _read_until_result(self, ws: aiohttp.ClientWebSocketResponse, *, expected_id: int) -> None:
         while True:
-            msg = await ws.receive_json()
-            if msg.get("id") != expected_id:
-                continue
-            if msg.get("type") != "result" or not msg.get("success"):
-                raise RuntimeError(f"Unexpected HA websocket result for id {expected_id}: {msg}")
-            return
+            raw_msg = await ws.receive_json()
+            for msg in self._iter_messages(raw_msg):
+                if msg.get("id") != expected_id:
+                    continue
+                if msg.get("type") != "result" or not msg.get("success"):
+                    raise RuntimeError(f"Unexpected HA websocket result for id {expected_id}: {msg}")
+                return
+
+    @staticmethod
+    def _iter_messages(payload: Any) -> list[dict[str, Any]]:
+        if isinstance(payload, dict):
+            return [payload]
+        if isinstance(payload, list):
+            messages: list[dict[str, Any]] = []
+            for item in payload:
+                if isinstance(item, dict):
+                    messages.append(item)
+                else:
+                    logger.debug("Ignoring unexpected non-dict Home Assistant websocket message item: %r", item)
+            return messages
+        logger.debug("Ignoring unexpected Home Assistant websocket payload type: %r", type(payload).__name__)
+        return []

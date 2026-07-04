@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.5.1
+
+- Fix the Home Assistant websocket listener so it correctly handles coalesced message batches instead of crashing on `list` payloads and silently breaking event-driven notifications.
+
 ## 0.5.0
 
 - Add optional OpenAI-powered notification enrichment so Watchtower can turn a snapshot into a short, fun notification description before delivery.

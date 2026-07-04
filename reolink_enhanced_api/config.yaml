@@ -1,5 +1,5 @@
 name: "Watchtower"
-version: "0.5.0"
+version: "0.5.1"
 description: "Camera event dashboard, clip playback, and live view for a Reolink NVR"
 slug: "watchtower"
 url: "https://github.com/marcusmaday/reolink-nvr-watchtower"

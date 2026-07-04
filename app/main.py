@@ -1197,7 +1197,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title=APP_NAME,
     description="Camera event dashboard, clip playback, and live view for a Reolink NVR",
-    version="0.5.0",
+    version="0.5.1",
     lifespan=lifespan,
 )
 
@@ -1832,7 +1832,7 @@ async def root(request: Request):
         return HTMLResponse(_dashboard_html_v2())
     return {
         "name": APP_NAME,
-        "version": "0.5.0",
+        "version": "0.5.1",
         "status": "running",
         "docs": "/docs",
         "health": "/api/health",
