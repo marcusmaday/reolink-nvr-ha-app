@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.5.3
+
+- Fix AI snapshot enrichment in the add-on by loading snapshot bytes through Home Assistant when `/local/...` images are not directly mounted inside the Watchtower container.
+- Keep the detailed AI-enrichment diagnostics so it is clear whether an event was skipped because of camera AI settings, missing API credentials, or an unavailable snapshot.
+
 ## 0.5.2
 
 - Add clearer AI-enrichment logging so it is obvious whether enrichment was skipped because of missing API credentials, per-camera AI settings, missing snapshot files, or request failures.

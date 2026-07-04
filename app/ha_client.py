@@ -44,6 +44,12 @@ class HomeAssistantClient:
             return "wss://" + self._base_url[len("https://"):] + "/websocket"
         return self._base_url + "/websocket"
 
+    @property
+    def root_url(self) -> str:
+        if self._base_url.endswith("/api"):
+            return self._base_url[: -len("/api")]
+        return self._base_url
+
     async def list_mobile_app_notify_services(self) -> list[str]:
         if not self.enabled:
             return []
@@ -81,6 +87,28 @@ class HomeAssistantClient:
             return []
         result = await self._request("GET", "/states")
         return result if isinstance(result, list) else []
+
+    async def fetch_bytes(self, path: str) -> bytes:
+        if not self.enabled:
+            raise HomeAssistantClientError("Missing SUPERVISOR_TOKEN")
+
+        normalized_path = path if path.startswith("/") else f"/{path}"
+        headers = {"Authorization": f"Bearer {self._supervisor_token}"}
+        url = f"{self.root_url}{normalized_path}"
+        timeout = aiohttp.ClientTimeout(total=20, connect=10, sock_connect=10, sock_read=20)
+
+        try:
+            async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
+                async with session.get(url) as resp:
+                    if resp.status >= 400:
+                        text = await resp.text()
+                        raise HomeAssistantClientError(
+                            f"Home Assistant fetch {normalized_path} failed with {resp.status}: {text[:400]}"
+                        )
+                    return await resp.read()
+        except aiohttp.ClientError as exc:
+            logger.error("Home Assistant binary fetch failed: %s", exc)
+            raise HomeAssistantClientError(str(exc)) from exc
 
     async def _request(self, method: str, path: str, json: dict[str, Any] | None = None) -> Any:
         if not self.enabled:

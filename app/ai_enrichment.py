@@ -42,7 +42,9 @@ class OpenAIEnrichmentClient:
     async def analyze_snapshot(
         self,
         *,
-        image_path: Path,
+        image_path: Path | None = None,
+        image_bytes: bytes | None = None,
+        image_name: str | None = None,
         event_type: str,
         camera_name: str,
         settings: AIEnrichmentSettings,
@@ -50,15 +52,12 @@ class OpenAIEnrichmentClient:
     ) -> NotificationEnrichmentResult:
         if not self._api_key:
             raise AIEnrichmentError("Missing OpenAI API key")
-        if not image_path.exists():
-            raise AIEnrichmentError(f"Snapshot file does not exist: {image_path}")
-
-        image_bytes = image_path.read_bytes()
-        if not image_bytes:
-            raise AIEnrichmentError(f"Snapshot file is empty: {image_path}")
-
-        mime_type = "image/png" if image_path.suffix.lower() == ".png" else "image/jpeg"
-        base64_image = base64.b64encode(image_bytes).decode("ascii")
+        snapshot_bytes, mime_type = self._resolve_image_payload(
+            image_path=image_path,
+            image_bytes=image_bytes,
+            image_name=image_name,
+        )
+        base64_image = base64.b64encode(snapshot_bytes).decode("ascii")
         prompt = self._build_prompt(
             event_type=event_type,
             camera_name=camera_name,
@@ -100,6 +99,32 @@ class OpenAIEnrichmentClient:
         content = self._extract_message_content(response_json)
         parsed = self._parse_json_payload(content)
         return NotificationEnrichmentResult.model_validate(parsed)
+
+    @staticmethod
+    def _resolve_image_payload(
+        *,
+        image_path: Path | None,
+        image_bytes: bytes | None,
+        image_name: str | None,
+    ) -> tuple[bytes, str]:
+        if image_bytes is not None:
+            if not image_bytes:
+                raise AIEnrichmentError("Snapshot bytes were empty")
+            suffix = Path(image_name or "snapshot.jpg").suffix.lower()
+            mime_type = "image/png" if suffix == ".png" else "image/jpeg"
+            return image_bytes, mime_type
+
+        if image_path is None:
+            raise AIEnrichmentError("No snapshot source was provided")
+        if not image_path.exists():
+            raise AIEnrichmentError(f"Snapshot file does not exist: {image_path}")
+
+        file_bytes = image_path.read_bytes()
+        if not file_bytes:
+            raise AIEnrichmentError(f"Snapshot file is empty: {image_path}")
+
+        mime_type = "image/png" if image_path.suffix.lower() == ".png" else "image/jpeg"
+        return file_bytes, mime_type
 
     async def _request(self, payload: dict[str, Any]) -> dict[str, Any]:
         timeout = aiohttp.ClientTimeout(
